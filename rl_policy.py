@@ -3,7 +3,7 @@ import onnxruntime
 import torch
 
 from utils.params import MUJOCO_TO_ISAAC, ISAAC_TO_MUJOCO
-from utils.math_utils import heading_quat
+from utils.math_utils import yaw_quat
 from scipy.spatial.transform import Rotation
 
 # base policy for deploy beyond mimic model
@@ -47,8 +47,8 @@ class RLBMPolicy(RLBasePolicy):
         super().__init__(onnx_model_path, obs_names)
         self.ref_motion = np.load(ref_motion_path)
         self.init_root_pos = self.ref_motion["body_pos_w"][0,0]
-        #self.init_root_pos[2] = 0  # set initial height to 0
-        self.init_root_heading = Rotation.from_quat(heading_quat(self.ref_motion["body_quat_w"][0,0][[1,2,3,0]]))
+        self.init_root_pos[2] = 0  # set initial height to 0
+        self.init_root_heading = Rotation.from_quat(yaw_quat(self.ref_motion["body_quat_w"][0,0])[[1,2,3,0]])
 
         self.init_robot_state = None
 
@@ -62,6 +62,7 @@ class RLBMPolicy(RLBasePolicy):
         else:
             self.action_scale = self.action_scale[ISAAC_TO_MUJOCO]
         self.motion_length = self.ref_motion["joint_pos"].shape[0]
+        print("Motion length:", self.motion_length)
         self.anchor_id = 0
     
 
@@ -105,7 +106,7 @@ class RLBMPolicy(RLBasePolicy):
     def get_action(self, obs):
         assert obs.shape == self.input_shape
         ort_inputs = {"obs": obs.astype(np.float32), 
-                      "time_step": np.array([[self.ticker]], dtype=np.float32)}
+                      "time_step": np.array([[0.0]], dtype=np.float32)}
         ort_outs = self.session.run(None, ort_inputs)
         self.ticker += 1
         return ort_outs[0].flatten()

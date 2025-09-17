@@ -27,12 +27,12 @@ motion = np.load(args.motion)
 
 motion_length = motion["joint_pos"].shape[0]
 
-fps = float(motion["fps"])
+fps = 50#float(motion["fps"])
 
 init_root_pos = motion["body_pos_w"][0,0]
 init_root_pos[2] = 0  # set initial height to 0
 init_root_heading = Rotation.from_quat(heading_quat(motion["body_quat_w"][0,0][[1,2,3,0]]))  # xyzw to wxyz
-frame_id = 9
+frame_id = 13
 while True:
     for i in range(motion_length):
         joint_pos = motion["joint_pos"][i]

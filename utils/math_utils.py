@@ -93,3 +93,38 @@ def add_random_rotation_noise(quat, noise_std):
     # Convert back to [x, y, z, w] format.
     noisy_quat = np.array([noisy_q_wxyz[1], noisy_q_wxyz[2], noisy_q_wxyz[3], noisy_q_wxyz[0]])
     return noisy_quat
+
+def normalize(q: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Normalize a batch of quaternions."""
+    norm = np.linalg.norm(q, axis=-1, keepdims=True)
+    return q / (norm + eps)
+
+def yaw_quat(quat: np.ndarray) -> np.ndarray:
+    """
+    Extract the yaw component of a quaternion (w, x, y, z).
+    
+    Args:
+        quat: The orientation in (w, x, y, z). Shape is (..., 4)
+    
+    Returns:
+        A quaternion with only yaw component. Same shape as input.
+    """
+    shape = quat.shape
+    quat_yaw = quat.reshape(-1, 4)
+
+    qw = quat_yaw[:, 0]
+    qx = quat_yaw[:, 1]
+    qy = quat_yaw[:, 2]
+    qz = quat_yaw[:, 3]
+
+    # yaw angle
+    yaw = np.arctan2(2 * (qw * qz + qx * qy),
+                     1 - 2 * (qy * qy + qz * qz))
+
+    # construct yaw-only quaternion
+    quat_yaw_out = np.zeros_like(quat_yaw)
+    quat_yaw_out[:, 0] = np.cos(yaw / 2.0)
+    quat_yaw_out[:, 3] = np.sin(yaw / 2.0)
+
+    quat_yaw_out = normalize(quat_yaw_out)
+    return quat_yaw_out.reshape(shape)

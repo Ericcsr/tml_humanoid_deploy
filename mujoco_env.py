@@ -300,7 +300,7 @@ class MujocoRobot:
             dq = self.dq_var.copy()
             imu_quat = self.imu_quat_var.copy()
             omega_w = self.omega_var.copy()
-        omega_l = Rotation.from_quat(imu_quat).inv().apply(omega_w)
+        omega_l = omega_w #Rotation.from_quat(imu_quat).inv().apply(omega_w)
         return q, dq, imu_quat, omega_l
     
     def get_root_state(self):
