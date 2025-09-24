@@ -9,6 +9,10 @@ from utils.robot_states import G1RobotState
 from utils.robot_model import KinematicsModel
 
 def main(env, policy, config):
+    
+    if config["use_root_state"] and config.get("use_odom", False):
+        kin_model = KinematicsModel(mocap_link_name="mid360_link" if config["use_sim"] else "head_link", use_slam=False)
+
     env.set_robot_state(policy.get_q_init())
     env.maintain_state(policy.get_q_init())
 
@@ -16,21 +20,21 @@ def main(env, policy, config):
 
     robot_state = G1RobotState()
 
-    # if config.use_root_state:
-    #     kin_model = KinematicsModel(mocap_link_names="mid360_link" if config.use_sim else "head_link")
 
     env.release_robot()  # let the robot move
     while True:
         robot_state.q, robot_state.dq, robot_state.imu_quat, robot_state.omega = env.get_robot_state()
         if config["use_root_state"]:
-            # robot_state.root_pos, robot_state.root_orn, robot_state.root_vel = kin_model.update_root_state(
-            #     q=robot_state.q,
-            #     dq=robot_state.dq,
-            #     imu_quat=robot_state.imu_quat,
-            #     omega=robot_state.omega,
-            # )
-            robot_state.root_pos, robot_state.root_orn, robot_state.root_vel = env.get_root_state()
-            robot_state.anchor_pos, robot_state.anchor_orn = env.get_anchor_state()
+            if config.get("use_odom", False):
+                robot_state.root_pos, robot_state.root_orn, robot_state.root_vel = kin_model.update_root_state(
+                    q=robot_state.q,
+                    dq=robot_state.dq,
+                    imu_quat=robot_state.imu_quat,
+                    omega=robot_state.omega,
+                )
+            else:
+                robot_state.root_pos, robot_state.root_orn, robot_state.root_vel = env.get_root_state()
+                robot_state.anchor_pos, robot_state.anchor_orn = env.get_anchor_state()
         
         control_signals = policy.prepare_control_signals(robot_state)
         obs = policy.prepare_obs(robot_state, control_signals) # Should be reference motion.
@@ -46,6 +50,7 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to the configuration file.")
     parser.add_argument("--use_sim", action="store_true", help="Use simulation environment instead of real robot.")
+    parser.add_argument("--use_odom", action="store_true", help="Use odometry for state estimation.")
     parser.add_argument("--net", type=str, required=False, help="Network interface for the robot controller.")
     args = parser.parse_args()
 
@@ -53,6 +58,10 @@ if __name__ == "__main__":
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
         config = config["rl_policy"]
+
+    # override config with command line args
+    config["use_sim"] = args.use_sim
+    config["use_odom"] = args.use_odom
 
     if args.use_sim:
         from mujoco_env import MujocoRobot

@@ -73,8 +73,8 @@ class RLBMPolicy(RLBasePolicy):
         mid = self.ticker if self.ticker < self.motion_length else self.motion_length-1
         ref_joint_pos = self.ref_motion["joint_pos"][mid] # don't matter that much
         ref_joint_vel = self.ref_motion["joint_vel"][mid]
-        ref_anchor_pos = self.ref_motion["body_pos_w"][mid, 9]
-        ref_anchor_orn = self.ref_motion["body_quat_w"][mid, 9][[1,2,3,0]]
+        ref_anchor_pos = self.ref_motion["body_pos_w"][mid, 0]
+        ref_anchor_orn = self.ref_motion["body_quat_w"][mid, 0][[1,2,3,0]]
         # compute relative to initial frame
         if self.init_robot_state is None:
             self.init_robot_state = (robot_state.root_pos.copy(), Rotation.from_quat(robot_state.root_orn.copy()))
@@ -85,8 +85,8 @@ class RLBMPolicy(RLBasePolicy):
         #rel_anchor_orn = (self.init_robot_state[1] * Rotation.from_quat(rel_anchor_orn)).as_quat()
         control_signals = {}
         control_signals["command"] = np.hstack([ref_joint_pos, ref_joint_vel])
-        anchor_rot_inv = Rotation.from_quat(robot_state.anchor_orn).inv()
-        control_signals["motion_anchor_pos_b"] = anchor_rot_inv.apply(rel_anchor_pos - robot_state.anchor_pos)
+        anchor_rot_inv = Rotation.from_quat(robot_state.root_orn).inv()
+        control_signals["motion_anchor_pos_b"] = anchor_rot_inv.apply(rel_anchor_pos - robot_state.root_pos)
         control_signals["motion_anchor_ori_b"] = (anchor_rot_inv * Rotation.from_quat(rel_anchor_orn)).as_matrix()[:,:2].flatten()
         return control_signals
 

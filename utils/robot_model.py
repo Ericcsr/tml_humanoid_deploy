@@ -139,18 +139,18 @@ class KinematicsModel:
     def update_root_state(
         self, q, imu_quat=None, dq=None, omega=None, head_pos=None, head_quat=None
     ):
-        if head_pos is None or head_quat is None:
-            self.head_pos = pickle.loads(self.redis_client.get("head_pos"))  # type: ignore
-            self.head_quat = pickle.loads(self.redis_client.get("head_quat"))  # type: ignore
-        else:
-            self.head_pos = head_pos
-            self.head_quat = head_quat
-
         self.q = q
         if self.use_slam:
+            if head_pos is None or head_quat is None:
+                self.head_pos = pickle.loads(self.redis_client.get("head_pos"))  # type: ignore
+                self.head_quat = pickle.loads(self.redis_client.get("head_quat"))  # type: ignore
+            else:
+                self.head_pos = head_pos
+                self.head_quat = head_quat
             root_pos_slam, root_quat_slam = get_root_pose_from_link(
                 self.robot, self.mocap_link_id, self.q, self.head_pos, self.head_quat
             )  # use full kinematic chain
+
 
         # fused_quat = self.quaternion_filter.process_imu(imu_quat)
         if self.use_slam:
@@ -185,6 +185,8 @@ class KinematicsModel:
             raise ValueError("dq and omega must be provided for velocity estimation")
         pb.resetBasePositionAndOrientation(self.robot, root_pos, self.root_quat)
         self.root_pose = np.concatenate((root_pos, self.root_quat))
+        # get local root velocity
+        root_vel = Rotation.from_quat(self.root_quat).inv().apply(root_vel)
         return self.root_pose[:3], self.root_pose[3:], root_vel
 
     def get_track_site(self):
