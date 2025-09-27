@@ -6,6 +6,7 @@ import pickle
 from threading import Lock
 import pybullet as pb
 from scipy.spatial.transform import Rotation
+from utils.math_utils import heading_zup
 
 import unitree_sdk2py
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
@@ -21,7 +22,6 @@ from unitree_sdk2py.utils.crc import CRC
 
 from utils.robot_utils import create_damping_cmd, create_zero_cmd, init_cmd_hg, MotorMode, RemoteController, KeyMap
 
-
 class UnitreeRobot:
     def __init__(self, 
                  net=None, 
@@ -31,8 +31,8 @@ class UnitreeRobot:
         self.action = np.zeros(29, dtype=np.float32)
         self.target_dof_pos = np.zeros(29, dtype = np.float32)
 
-        self.kp = np.array(config.joint_stiffness, dtype=np.float32)
-        self.kd = np.array(config.joint_damping, dtype=np.float32)
+        self.kp = np.array(config["joint_stiffness"], dtype=np.float32)
+        self.kd = np.array(config["joint_damping"], dtype=np.float32)
 
         self.counter = 0
         self.control_dt = config.get("control_dt", 0.02)
@@ -72,8 +72,14 @@ class UnitreeRobot:
         print("Successfully connected to the robot.")
 
     def _get_imu_quat(self):
-        return self.low_state.imu_state.quaternion
-    
+        if not hasattr(self, "init_heading"):
+            self.init_heading = heading_zup(np.array(self.low_state.imu_state.quaternion)[[1,2,3,0]])
+            self.init_heading_quat = Rotation.from_euler("z", self.init_heading).as_quat()
+        current_quat = np.array(self.low_state.imu_state.quaternion)[[1,2,3,0]]
+        current_quat = Rotation.from_quat(current_quat)
+        current_quat = (Rotation.from_quat(self.init_heading_quat).inv() * current_quat).as_quat()
+        return current_quat
+
     def _get_omega(self):
         return np.array(self.low_state.imu_state.gyroscope)
 
@@ -165,3 +171,6 @@ class UnitreeRobot:
         self.pd_control(target_q)
         # time.sleep(self.control_dt)
         self.control_lock.release()
+
+    def release_robot(self):
+        pass

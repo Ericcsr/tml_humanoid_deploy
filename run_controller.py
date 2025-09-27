@@ -11,7 +11,7 @@ from utils.robot_model import KinematicsModel
 def main(env, policy, config):
     
     if config["use_root_state"] and config.get("use_odom", False):
-        kin_model = KinematicsModel(mocap_link_name="mid360_link" if config["use_sim"] else "head_link", use_slam=False)
+        kin_model = KinematicsModel(mocap_link_name="mid360_link" if config["use_sim"] else "head_link", use_slam=False, visualize=True)
 
     env.set_robot_state(policy.get_q_init())
     env.maintain_state(policy.get_q_init())
@@ -19,7 +19,6 @@ def main(env, policy, config):
     rate = Rate(1/config.get("control_dt", 0.02))  # 50 Hz
 
     robot_state = G1RobotState()
-
 
     env.release_robot()  # let the robot move
     while True:
@@ -32,6 +31,7 @@ def main(env, policy, config):
                     imu_quat=robot_state.imu_quat,
                     omega=robot_state.omega,
                 )
+                robot_state.root_orn = robot_state.imu_quat # wxyz
             else:
                 robot_state.root_pos, robot_state.root_orn, robot_state.root_vel = env.get_root_state()
                 robot_state.anchor_pos, robot_state.anchor_orn = env.get_anchor_state()
@@ -53,12 +53,12 @@ if __name__ == "__main__":
     parser.add_argument("--use_odom", action="store_true", help="Use odometry for state estimation.")
     parser.add_argument("--net", type=str, required=False, help="Network interface for the robot controller.")
     args = parser.parse_args()
-
+    
     import yaml
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
         config = config["rl_policy"]
-
+    
     # override config with command line args
     config["use_sim"] = args.use_sim
     config["use_odom"] = args.use_odom
