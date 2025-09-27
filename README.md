@@ -16,6 +16,7 @@ python run_controller.py --use_sim --config exported_policies/sirui_test/experim
 ## Run sim2sim with foot odometer as velocity and position estimator
 ```
 python run_controller.py --use_sim --config exported_policies/sirui_test/experiment.yaml --use_odom
+python run_controller.py --use_sim --config exported_policies/yanjie_test/experiment.yaml --use_odom
 ```
 
 ## Some note
