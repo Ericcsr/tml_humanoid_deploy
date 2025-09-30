@@ -8,16 +8,16 @@ import pybullet as pb
 from scipy.spatial.transform import Rotation
 from tml_humanoid_deploy.utils.math_utils import heading_zup
 
-import unitree_sdk2py
-from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_, unitree_hg_msg_dds__LowState_
-from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_, unitree_go_msg_dds__LowState_
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_ as LowCmdHG
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_ as LowCmdGo
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_ as LowStateHG
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_ as LowStateGo
-from unitree_sdk2py.utils.crc import CRC
+import unitree_sdk2py  # type: ignore
+from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber  # type: ignore
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize  # type: ignore
+from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_, unitree_hg_msg_dds__LowState_  # type: ignore
+from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_, unitree_go_msg_dds__LowState_  # type: ignore
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_ as LowCmdHG  # type: ignore
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_ as LowCmdGo  # type: ignore
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_ as LowStateHG  # type: ignore
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_ as LowStateGo  # type: ignore
+from unitree_sdk2py.utils.crc import CRC  # type: ignore
 
 
 from tml_humanoid_deploy.utils.robot_utils import create_damping_cmd, create_zero_cmd, init_cmd_hg, MotorMode, RemoteController, KeyMap
@@ -182,3 +182,4 @@ class UnitreeRobot(BaseRobotEnv):
         self.pd_control(target_q)
         # time.sleep(self.control_dt)
         self.control_lock.release()
+    

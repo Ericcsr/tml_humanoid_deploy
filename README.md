@@ -5,30 +5,10 @@ A deployment framework for humanoid robot control supporting both MuJoCo simulat
 ## Installation
 
 ```bash
-# Install the package in development mode
+Install all dependencies
+Then install the package with
 pip install -e .
 
-# Or install dependencies manually
-pip install -r requirements.txt
-```
-
-## Package Structure
-
-```
-tml_humanoid_deploy/
-├── README.md                    # This file
-├── setup.py                     # Package setup
-├── requirements.txt             # Dependencies
-├── scripts/                     # Entry point scripts
-│   ├── mujoco_launch.py        # MuJoCo simulation launcher
-│   ├── real_launch.py          # Real robot launcher  
-│   └── run_controller.py       # Main controller logic
-├── tml_humanoid/               # Main package
-│   ├── agents/                 # Policy implementations
-│   ├── envs/                   # Environment implementations
-│   └── utils/                  # Utility modules
-├── exported_policies/          # Trained policies (deployment artifacts)
-└── tools/                      # Development tools
 ```
 
 ## Usage
@@ -36,6 +16,9 @@ tml_humanoid_deploy/
 ### MuJoCo Simulation
 ```bash
 python scripts/mujoco_launch.py --config exported_policies/sirui_test/experiment.yaml
+OR
+python mujoco_launch --config exported_policies/sirui_test/experiment.yaml
+
 ```
 
 ### With Odometry
@@ -43,9 +26,12 @@ python scripts/mujoco_launch.py --config exported_policies/sirui_test/experiment
 python scripts/mujoco_launch.py --config exported_policies/sirui_test/experiment.yaml --use_odom
 ```
 
-### Real Robot (DANGER!)
+### Real Robot
 ```bash
 python scripts/real_launch.py --config exported_policies/sirui_test/experiment.yaml --net <network_interface>
+OR
+real_launch --config exported_policies/sirui_test/experiment.yaml --net <network_interface>
+
 ```
 
 ## Configuration
@@ -58,4 +44,4 @@ Experiment configurations are stored in `exported_policies/`. Each experiment fo
 ## Notes
 
 1. Anchor link is reset to `pelvis` instead of default `torso_link`
-2. For questions, contact Sirui Chen `ericcsr@stanford.edu` or Takara Truong 'takaraet@stanford.edu'
+2. For questions, contact Sirui Chen `ericcsr@stanford.edu`

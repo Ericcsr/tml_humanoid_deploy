@@ -69,8 +69,8 @@ def run_simulation(control_lock, data_lock, xml_path, config):
             xml = f.read()
         
         print(xml_path)
-        model = mujoco.MjModel.from_xml_string(xml)
-        data = mujoco.MjData(model)
+        model = mujoco.MjModel.from_xml_string(xml) # type: ignore
+        data = mujoco.MjData(model)  # type: ignore
 
         viewer = mujoco.viewer.launch_passive(model, data, key_callback=None)
         
@@ -98,7 +98,7 @@ def run_simulation(control_lock, data_lock, xml_path, config):
                 tau = pd_control(control[:29], data, kp_shared, kd_shared)
             data.ctrl[:] = tau.clip(-torque_limit, torque_limit)
             
-            mujoco.mj_step(model, data)
+            mujoco.mj_step(model, data)  # type: ignore
             with data_lock:
                 q[:] = data.qpos[7:36].copy()
                 dq[:] = data.qvel[6:35].copy()
