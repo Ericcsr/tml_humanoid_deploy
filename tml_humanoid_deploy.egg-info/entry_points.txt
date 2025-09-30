@@ -1,0 +1,3 @@
+[console_scripts]
+mujoco_launch = scripts.mujoco_launch:main
+real_launch = scripts.real_launch:main

@@ -1,3 +1,36 @@
+Metadata-Version: 2.4
+Name: tml-humanoid-deploy
+Version: 0.1.0
+Summary: Humanoid robot deployment framework for simulation and real-world control
+Author-email: TML Robotics Team <contact@tml-robotics.com>
+License: MIT
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Topic :: Scientific/Engineering :: Robotics
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: torch
+Requires-Dist: onnxruntime
+Requires-Dist: pyyaml
+Requires-Dist: redis
+Requires-Dist: mujoco
+Requires-Dist: unitree-sdk2py
+Requires-Dist: pybullet
+Provides-Extra: dev
+Requires-Dist: pytest>=6.0; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Requires-Dist: black; extra == "dev"
+Requires-Dist: flake8; extra == "dev"
+Requires-Dist: mypy; extra == "dev"
+
 # TML Humanoid Deploy
 
 A deployment framework for humanoid robot control supporting both MuJoCo simulation and real robot hardware.

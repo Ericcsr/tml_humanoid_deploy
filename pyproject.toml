@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tml-humanoid-deploy"
+version = "0.1.0"
+description = "Humanoid robot deployment framework for simulation and real-world control"
+authors = [
+    {name = "TML Robotics Team", email = "contact@tml-robotics.com"}
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Robotics",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "torch",
+    "onnxruntime",
+    "pyyaml",
+    "redis",
+    "mujoco",
+    "unitree-sdk2py",
+    "pybullet",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov",
+    "black",
+    "flake8",
+    "mypy",
+]
+
+[project.scripts]
+mujoco_launch = "scripts.mujoco_launch:main"
+real_launch = "scripts.real_launch:main"
+
+[tool.setuptools.packages.find]
+include = ["tml_humanoid_deploy*", "scripts*"]
+
+[tool.setuptools.package-data]
+tml_humanoid_deploy = ["envs/assets/**/*"]
+
+[tool.setuptools]
+py-modules = []

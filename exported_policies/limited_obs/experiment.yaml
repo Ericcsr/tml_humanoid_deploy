@@ -1,7 +1,7 @@
 rl_policy:
   onnx_model_path: "exported_policies/limited_obs/2025-09-26_13-46-45_rightturn_pelvis_lim_obs.onnx"
   ref_motion_path: "exported_policies/limited_obs/motion.npz"
-  mujoco_xml_path: "assets/g1/scene_29dof.xml"
+  mujoco_xml_path: "tml_humanoid_deploy/envs/assets/g1/scene_29dof.xml"
   use_root_state: True
 
   obs_names:
@@ -110,3 +110,23 @@ rl_policy:
     - 25
     - 5
     - 5
+
+
+standby_policy:
+  default_pose: [ -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,
+                  -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,
+                  0.0, 0.0, 0.073,
+                  0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0,
+                  0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0 ]
+  
+  joint_stiffness: [ 350.0, 200.0, 200.0, 300.0, 300.0, 150.0,
+                     350.0, 200.0, 200.0, 300.0, 300.0, 150.0,
+                     200.0, 200.0, 200.0,
+                     40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0,
+                     40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0 ]
+
+  joint_damping: [ 5.0, 5.0, 5.0, 10.0, 5.0, 5.0,
+                   5.0, 5.0, 5.0, 10.0, 5.0, 5.0,
+                   5.0, 5.0, 5.0,
+                   3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0,
+                   3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0 ]
