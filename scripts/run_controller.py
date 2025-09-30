@@ -19,7 +19,7 @@ def run_controller(
 ) -> None:
     
     if config["use_root_state"] and config.get("use_odom", False):
-        kin_model = KinematicsModel(mocap_link_name="mid360_link" if config["use_sim"] else "head_link", use_slam=False, visualize=True)
+        kin_model = KinematicsModel(mocap_link_name="mid360_link" if config["use_sim"] else "head_link", use_slam=False, visualize=False)
     
     # Get standby pose and gains
     standby_pose = np.array(standby_config.get("default_pose", policy.get_q_init()), dtype=np.float32)

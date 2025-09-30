@@ -1,6 +1,7 @@
 .gitignore
 README.md
 pyproject.toml
+requirements.txt
 .vscode/settings.json
 exported_policies/limited_obs/2025-09-26_13-46-45_rightturn_pelvis_lim_obs.onnx
 exported_policies/limited_obs/experiment.yaml

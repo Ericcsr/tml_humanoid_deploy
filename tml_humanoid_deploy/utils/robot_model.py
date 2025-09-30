@@ -69,7 +69,7 @@ class KinematicsModel:
     ):
         pb.connect(pb.GUI if visualize else pb.DIRECT)
         self.redis_client = redis.Redis(redis_ip, port=redis_port, db=0)
-        self.robot = pb.loadURDF(f"{current_file_directory}/../tml_humanoid_deploy/envs/assets/g1/g1_29dof_kin_extended.urdf")
+        self.robot = pb.loadURDF(f"{current_file_directory}/../envs/assets/g1/g1_29dof_kin_extended.urdf")
         self.link_names = [
             pb.getJointInfo(self.robot, i)[12].decode() for i in range(pb.getNumJoints(self.robot))
         ]
@@ -81,13 +81,13 @@ class KinematicsModel:
                 j += 1
         if ref_robot:
             self.ref_robot = pb.loadURDF(
-                f"{current_file_directory}/../tml_humanoid_deploy/envs/assets/g1/g1_29dof_kin_extended.urdf"
+                f"{current_file_directory}/../envs/assets/g1/g1_29dof_kin_extended.urdf"
             )
             for link_id in range(-1, pb.getNumJoints(self.ref_robot)):
                 pb.changeVisualShape(self.ref_robot, link_id, rgbaColor=[0, 1, 0, 1])
 
         self.track_sites = [
-            pb.loadURDF(f"{current_file_directory}/../tml_humanoid_deploy/envs/assets/frame.urdf") for _ in range(3)
+            pb.loadURDF(f"{current_file_directory}/../envs/assets/frame.urdf") for _ in range(3)
         ]
         self.eef_id = [
             self.link_names.index(name) for name in ["left_rubber_hand", "right_rubber_hand"]

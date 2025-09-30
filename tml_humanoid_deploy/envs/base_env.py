@@ -22,16 +22,6 @@ class BaseRobotEnv(ABC):
         pass
     
     @abstractmethod
-    def get_root_state(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Get the root state (position, orientation, velocity)."""
-        pass
-    
-    @abstractmethod
-    def get_anchor_state(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Get the anchor state (position, orientation)."""
-        pass
-    
-    @abstractmethod
     def step_robot(self, action: np.ndarray) -> None:
         """Execute a control action on the robot."""
         pass
