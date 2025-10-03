@@ -161,7 +161,8 @@ class KinematicsModel:
                 self.root_pose = np.concatenate((root_pos_slam, self.root_quat))
                 return self.root_pose
         else:
-            self.root_quat = self.quaternion_filter.update(imu_quat, self.root_quat)
+            #self.root_quat = self.quaternion_filter.update(imu_quat, self.root_quat)
+            self.root_quat = imu_quat # directly use imu quaternion
         if dq is not None and omega is not None:
             root_vel, z = self.foot_odo.estimate_velocity(q, dq, self.root_quat, omega)
             if self.use_slam:
@@ -188,6 +189,19 @@ class KinematicsModel:
         # get local root velocity
         root_vel = Rotation.from_quat(self.root_quat).inv().apply(root_vel)
         return self.root_pose[:3], self.root_pose[3:], root_vel
+
+    # For visualize and debug slam only
+    def update_root_state_slam(
+            self, q, imu_quat=None, dq=None, omega=None, head_pos=None, head_quat=None
+    ):
+        self.q = q
+        self.head_pos = pickle.loads(self.redis_client.get("head_pos"))  # type: ignore
+        self.head_quat = pickle.loads(self.redis_client.get("head_quat"))
+        root_pos_slam, root_quat_slam = get_root_pose_from_link(
+            self.robot, self.mocap_link_id, self.q, self.head_pos, self.head_quat
+        )  # use full kinematic chain
+        pb.resetBasePositionAndOrientation(self.robot, root_pos_slam, root_quat_slam)
+        return root_pos_slam, root_quat_slam, np.zeros(3)
 
     def get_track_site(self):
         self.set_robot_state(self.q, self.root_pose)

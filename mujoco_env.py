@@ -6,11 +6,13 @@ import torch
 from scipy.spatial.transform import Rotation
 import scipy
 import pickle
+import redis
 from utils.math_utils import *
 
 import multiprocessing as mp
 from multiprocessing.shared_memory import SharedMemory
 from utils.robot_utils import Rate
+from utils.redis_utils import REDIS_IP, REDIS_PORT
 
 G1_LINKS = [
     'pelvis', 
@@ -158,6 +160,8 @@ def run_simulation(control_lock, data_lock, xml_path, config):
         model = mujoco.MjModel.from_xml_string(xml)
         data = mujoco.MjData(model)
 
+        redis_client = redis.Redis(host=REDIS_IP, port=REDIS_PORT, db=0)
+
         elastic_band = ElasticBand()
         band_attached_link = model.body("torso_link").id
 
@@ -180,9 +184,9 @@ def run_simulation(control_lock, data_lock, xml_path, config):
 
         model.opt.timestep = config.get("simulation_dt", 0.005)
         rate = Rate(1/model.opt.timestep)  # 200 Hz by default
-
+        ts = time.time()
         while True:
-            #ts = time.time()
+            
             with control_lock:
                 if control[0] > 180:
                     print("Damping mode")
@@ -233,6 +237,11 @@ def run_simulation(control_lock, data_lock, xml_path, config):
                 torso_pos[:] = data.xpos[model.body("torso_link").id].copy()
                 torso_orn[:] = data.xquat[model.body("torso_link").id][[1,2,3,0]].copy()
             # viewer.render()
+            now = time.time()
+            if now - ts > 0.1:
+                redis_client.set("head_pos", pickle.dumps(data.xpos[model.body("torso_link").id].copy()))
+                redis_client.set("head_quat", pickle.dumps(data.xquat[model.body("torso_link").id][[1,2,3,0]].copy()))
+                ts = now
             viewer.sync()                                                                  
             rate.sleep()
             #print("Sim step fps:", 1/(time.time() - ts))

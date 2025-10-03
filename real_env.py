@@ -6,21 +6,23 @@ import pickle
 from threading import Lock
 import pybullet as pb
 from scipy.spatial.transform import Rotation
+from utils.math_utils import heading_zup
 
-import unitree_sdk2py
-from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_, unitree_hg_msg_dds__LowState_
-from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_, unitree_go_msg_dds__LowState_
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_ as LowCmdHG
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_ as LowCmdGo
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_ as LowStateHG
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_ as LowStateGo
-from unitree_sdk2py.utils.crc import CRC
+import unitree_sdk2py  # type: ignore
+from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber  # type: ignore
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize  # type: ignore
+from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_, unitree_hg_msg_dds__LowState_  # type: ignore
+from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_, unitree_go_msg_dds__LowState_  # type: ignore
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_ as LowCmdHG  # type: ignore
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_ as LowCmdGo  # type: ignore
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_ as LowStateHG  # type: ignore
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_ as LowStateGo  # type: ignore
+from unitree_sdk2py.utils.crc import CRC  # type: ignore
 
 
 from utils.robot_utils import create_damping_cmd, create_zero_cmd, init_cmd_hg, MotorMode, RemoteController, KeyMap
 
+STOP_BUTTON = [KeyMap.select, KeyMap.B, KeyMap.X, KeyMap.Y, KeyMap.up, KeyMap.right, KeyMap.down, KeyMap.left]
 
 class UnitreeRobot:
     def __init__(self, 
@@ -31,8 +33,8 @@ class UnitreeRobot:
         self.action = np.zeros(29, dtype=np.float32)
         self.target_dof_pos = np.zeros(29, dtype = np.float32)
 
-        self.kp = np.array(config.joint_stiffness, dtype=np.float32)
-        self.kd = np.array(config.joint_damping, dtype=np.float32)
+        self.kp = np.array(config["joint_stiffness"], dtype=np.float32)
+        self.kd = np.array(config["joint_damping"], dtype=np.float32)
 
         self.counter = 0
         self.control_dt = config.get("control_dt", 0.02)
@@ -72,34 +74,34 @@ class UnitreeRobot:
         print("Successfully connected to the robot.")
 
     def _get_imu_quat(self):
-        return self.low_state.imu_state.quaternion
-    
+        if not hasattr(self, "init_heading"):
+            self.init_heading = heading_zup(np.array(self.low_state.imu_state.quaternion)[[1,2,3,0]])
+            self.init_heading_quat = Rotation.from_euler("z", self.init_heading).as_quat()
+        current_quat = np.array(self.low_state.imu_state.quaternion)[[1,2,3,0]]
+        current_quat = Rotation.from_quat(current_quat)
+        current_quat = (Rotation.from_quat(self.init_heading_quat).inv() * current_quat).as_quat()
+        return current_quat
+
     def _get_omega(self):
         return np.array(self.low_state.imu_state.gyroscope)
 
-    def pd_control(self, target_q):
-        assert len(target_q) == 29
+    def pd_control(self, target_q, kp= None, kd = None):
+        final_kp = self.kp if kp is None else kp
+        final_kd = self.kd if kd is None else kd
+        
+        assert len(target_q) == 29 
+        assert len(final_kp) == 29 
+        assert len(final_kd) == 29
+
         for i in range(len(target_q)):
             self.low_cmd.motor_cmd[i].q = target_q[i]
             self.low_cmd.motor_cmd[i].dq = 0
-            self.low_cmd.motor_cmd[i].kp = self.kp[i]
-            self.low_cmd.motor_cmd[i].kd = self.kd[i]
+            self.low_cmd.motor_cmd[i].kp = final_kp[i]
+            self.low_cmd.motor_cmd[i].kd = final_kd[i]
             self.low_cmd.motor_cmd[i].tau = 0
+        
         self.send_cmd(self.low_cmd)
     
-    def maintain_state(self, q):
-        print("Maintaining state, wait for A signal...")
-        target_q = np.zeros(29, dtype=np.float32)
-        target_q[:] = q
-        while self.remote_controller.button[KeyMap.A] != 1:
-            self.control_lock.acquire()
-            if self.terminated:
-                print("Exiting...")
-                exit(-1)
-            self.pd_control(target_q)
-            time.sleep(self.control_dt)
-            self.control_lock.release()
-
     def damping_state(self):
         print("Entering damping state")
         self.control_lock.acquire()
@@ -126,7 +128,7 @@ class UnitreeRobot:
         self.send_cmd(self.low_cmd)
         time.sleep(self.control_dt)
 
-    def set_robot_state(self, q): # q 27 dof
+    def set_robot_state(self, q, kp=None, kd=None):
         total_time = 2
         num_step = int(total_time/self.control_dt)
         
@@ -136,32 +138,46 @@ class UnitreeRobot:
         target_q[:] = q
         for i in dof_idx:
             init_q[i] = self.low_state.motor_state[i].q
-
+    
         for i in range(num_step):
             alpha = i / num_step
-            self.pd_control(init_q*(1-alpha)+target_q*alpha)
+            self.pd_control(init_q*(1-alpha)+target_q*alpha, kp=kp, kd=kd)
             time.sleep(self.control_dt)
+    
+    def maintain_state(self, q, kp=None, kd=None):
+        print("Maintaining state, wait for L1 + A signal...")
+        target_q = np.zeros(29, dtype=np.float32)
+        target_q[:] = q
+        while not (self.remote_controller.button[KeyMap.L1] == 1 and self.remote_controller.button[KeyMap.A] == 1):
+            self.control_lock.acquire()
+            if self.terminated:
+                print("Exiting...")
+                exit(-1)
+            self.pd_control(target_q, kp=kp, kd=kd)
+            time.sleep(self.control_dt)
+            self.control_lock.release()
 
     def get_robot_state(self):
         for i in range(29):
             self.qj[i] = self.low_state.motor_state[i].q
             self.dqj[i] = self.low_state.motor_state[i].dq
-            # r = Rotation.from_euler("xyz", [0, 0, -self.qj[12]])
-            # root_quat = (Rotation.from_quat(self.head_quat) * r).as_quat()
         imu_quat = self._get_imu_quat()
         omega = self._get_omega()
         return self.qj, self.dqj, imu_quat, omega
 
     def step_robot(self, action):
         self.control_lock.acquire()
-        if self.remote_controller.button[KeyMap.select] == 1:
+        if any(self.remote_controller.button[btn] == 1 for btn in STOP_BUTTON):
             self.damping_state()
             self.terminated = True
         if self.terminated:
             print("Exiting...")
-            exit(-1)
+            exit(-1)    
         target_q = np.zeros(29, dtype=np.float32)
         target_q[:] = action
         self.pd_control(target_q)
         # time.sleep(self.control_dt)
         self.control_lock.release()
+    
+    def release_robot(self):
+        pass

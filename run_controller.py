@@ -11,7 +11,7 @@ from utils.robot_model import KinematicsModel
 def main(env, policy, config):
     
     if config["use_root_state"] and config.get("use_odom", False):
-        kin_model = KinematicsModel(mocap_link_name="mid360_link" if config["use_sim"] else "head_link", use_slam=False)
+        kin_model = KinematicsModel(mocap_link_name="torso_link" if config["use_sim"] else "mid360_link", use_slam=config["use_slam"], visualize=True)
 
     env.set_robot_state(policy.get_q_init())
     env.maintain_state(policy.get_q_init())
@@ -51,6 +51,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True, help="Path to the configuration file.")
     parser.add_argument("--use_sim", action="store_true", help="Use simulation environment instead of real robot.")
     parser.add_argument("--use_odom", action="store_true", help="Use odometry for state estimation.")
+    parser.add_argument("--use_slam", action="store_true", help="Use lidar for state estimation.")
     parser.add_argument("--net", type=str, required=False, help="Network interface for the robot controller.")
     args = parser.parse_args()
 
@@ -62,6 +63,7 @@ if __name__ == "__main__":
     # override config with command line args
     config["use_sim"] = args.use_sim
     config["use_odom"] = args.use_odom
+    config["use_slam"] = args.use_slam
 
     if args.use_sim:
         from mujoco_env import MujocoRobot

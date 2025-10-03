@@ -19,6 +19,8 @@ python run_controller.py --use_sim --config exported_policies/sirui_test/experim
 python run_controller.py --use_sim --config exported_policies/yanjie_test/experiment.yaml --use_odom
 ```
 
+
+
 ## Some note
 1. Sim2Real code remain untested
 2. Anchor link is reset to `pelvis` instead of default `torso_link`.

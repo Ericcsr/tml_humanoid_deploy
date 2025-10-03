@@ -230,12 +230,13 @@ class RootPoseFilterSimple:
 
 
 class FootOdometer:
-    def __init__(self, robot_id, pb_kin, foot_link_names):
+    def __init__(self, robot_id, pb_kin, foot_link_names, clip_factor=2.0):
         self.robot_id = robot_id
         self.pb_kin = pb_kin
         self.foot_contact_ids = [self.pb_kin.link_names.index(name) for name in foot_link_names]
         self.last_velocity = None
         self.last_id = None
+        self.clip_factor = clip_factor
 
     def estimate_from_vel_continuity(self, link_states, omega):
         low_c_pos = None
@@ -273,6 +274,11 @@ class FootOdometer:
                 root_vel = -c_vel - np.cross(omega, c_pos)
         return root_vel, -low_c_pos[2]  # assume flat ground
 
+    def clip_velocity(self):
+        vel_norm = np.linalg.norm(self.last_velocity)
+        if vel_norm > self.clip_factor:
+            self.last_velocity = self.last_velocity / vel_norm * self.clip_factor
+
     def estimate_velocity(self, q, dq, quat, omega):
         """
         q: joint angles
@@ -301,6 +307,7 @@ class FootOdometer:
             self.last_velocity = root_vel_continuity.copy()
             z = z_continuity  # assume flat ground
 
+        self.clip_velocity()
         return self.last_velocity.copy(), z  # assume flat ground
 
 
