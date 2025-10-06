@@ -26,7 +26,7 @@ def main():
         config = yaml.safe_load(f)
         rl_config = config["rl_policy"]
         standby_config = config.get("standby_policy", {})
-
+    
     # Force real robot mode
     rl_config["use_sim"] = False
     rl_config["use_odom"] = args.use_odom

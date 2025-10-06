@@ -105,6 +105,10 @@ class RemoteController:
         self.rx = 0
         self.ry = 0
         self.button = [0] * 16
+        
+        # Define button groups for different actions
+        self.stop_buttons = [KeyMap.select, KeyMap.B, KeyMap.X, KeyMap.Y, 
+                            KeyMap.up, KeyMap.right, KeyMap.down, KeyMap.left]
 
     def set(self, data):
         # wireless_remote
@@ -115,3 +119,23 @@ class RemoteController:
         self.rx = struct.unpack("f", data[8:12])[0]
         self.ry = struct.unpack("f", data[12:16])[0]
         self.ly = struct.unpack("f", data[20:24])[0]
+    
+    def is_stop_pressed(self) -> bool:
+        """Check if any stop button is pressed."""
+        return any(self.button[btn] == 1 for btn in self.stop_buttons)
+    
+    def is_start_pressed(self) -> bool:
+        """Check if start button is pressed."""
+        return self.button[KeyMap.start] == 1
+    
+    def is_begin_control_pressed(self) -> bool:
+        """Check if L1 + A are pressed together to begin control."""
+        return self.button[KeyMap.L1] == 1 and self.button[KeyMap.A] == 1
+    
+    def is_reset_pressed(self) -> bool:
+        """Check if R1 button is pressed to reset to standby pose."""
+        return self.button[KeyMap.R1] == 1 and self.button[KeyMap.up] == 1
+    
+    def get_button(self, key: int) -> int:
+        """Get the state of a specific button by key."""
+        return self.button[key]

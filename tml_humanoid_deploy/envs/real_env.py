@@ -112,7 +112,7 @@ class UnitreeRobot(BaseRobotEnv):
     def zero_torque_state(self):
         print("Enter zero torque state.")
         print("Waiting for the start signal...")
-        while self.remote_controller.button[KeyMap.start] != 1:
+        while not self.remote_controller.is_start_pressed():
             self.control_lock.acquire()
             if self.terminated:
                 print("Exiting...")
@@ -147,7 +147,7 @@ class UnitreeRobot(BaseRobotEnv):
         print("Maintaining state, wait for L1 + A signal...")
         target_q = np.zeros(29, dtype=np.float32)
         target_q[:] = q
-        while not (self.remote_controller.button[KeyMap.L1] == 1 and self.remote_controller.button[KeyMap.A] == 1):
+        while not self.remote_controller.is_begin_control_pressed():
             self.control_lock.acquire()
             if self.terminated:
                 print("Exiting...")
@@ -170,8 +170,7 @@ class UnitreeRobot(BaseRobotEnv):
 
     def step_robot(self, action):
         self.control_lock.acquire()
-        stop_buttons = [KeyMap.select, KeyMap.B, KeyMap.X, KeyMap.Y, KeyMap.up, KeyMap.right, KeyMap.down, KeyMap.left]
-        if any(self.remote_controller.button[btn] == 1 for btn in stop_buttons):
+        if self.remote_controller.is_stop_pressed():
             self.damping_state()
             self.terminated = True
         if self.terminated:
