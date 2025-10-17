@@ -188,7 +188,8 @@ class KinematicsModel:
         self.root_pose = np.concatenate((root_pos, self.root_quat))
         # get local root velocity
         root_vel = Rotation.from_quat(self.root_quat).inv().apply(root_vel)
-        return self.root_pose[:3], self.root_pose[3:], root_vel
+        #return self.root_pose[:3], self.root_pose[3:], root_vel
+        return root_pos_slam, self.root_quat, root_vel
 
     # For visualize and debug slam only
     def update_root_state_slam(

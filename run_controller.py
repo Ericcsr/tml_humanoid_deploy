@@ -11,7 +11,7 @@ from utils.robot_model import KinematicsModel
 def main(env, policy, config):
     
     if config["use_root_state"] and config.get("use_odom", False):
-        kin_model = KinematicsModel(mocap_link_name="torso_link" if config["use_sim"] else "mid360_link", use_slam=config["use_slam"], visualize=True)
+        kin_model = KinematicsModel(mocap_link_name="torso_link" if config["use_sim"] else "mid360_link", use_slam=config["use_slam"], visualize=False)
 
     env.set_robot_state(policy.get_q_init())
     env.maintain_state(policy.get_q_init())
@@ -71,6 +71,10 @@ if __name__ == "__main__":
     else:
         from real_env import UnitreeRobot
         env = UnitreeRobot(args.net, config)
-    policy = RLBMPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"])
+
+    lookahead_steps = config.get("lookahead_steps",1)
+    lookahead_frame_skips = config.get("lookahead_frame_skips",1)
+    policy = RLBMPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
+                        lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips)
 
     main(env, policy, config)

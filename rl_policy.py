@@ -4,6 +4,7 @@ import torch
 
 from utils.params import MUJOCO_TO_ISAAC, ISAAC_TO_MUJOCO
 from utils.math_utils import yaw_quat
+from utils.storage_utils import ObsQueue
 from scipy.spatial.transform import Rotation
 
 # base policy for deploy beyond mimic model
@@ -43,7 +44,7 @@ class RLBasePolicy:
 
 
 class RLBMPolicy(RLBasePolicy):
-    def __init__(self, onnx_model_path, obs_names, ref_motion_path):
+    def __init__(self, onnx_model_path, obs_names, ref_motion_path, lookahead_steps=1, lookahead_frame_skips=1):
         super().__init__(onnx_model_path, obs_names)
         self.ref_motion = np.load(ref_motion_path)
         self.init_root_pos = self.ref_motion["body_pos_w"][0,0]
@@ -64,6 +65,9 @@ class RLBMPolicy(RLBasePolicy):
         self.motion_length = self.ref_motion["joint_pos"].shape[0]
         print("Motion length:", self.motion_length)
         self.anchor_id = 0
+        if lookahead_steps != 1:
+            self.obs_queue = ObsQueue(max_size=lookahead_steps, stride=lookahead_frame_skips)
+            self.delay_queue = ObsQueue(max_size=lookahead_steps, stride=lookahead_frame_skips)
     
 
     def get_q_init(self):
@@ -84,7 +88,17 @@ class RLBMPolicy(RLBasePolicy):
         #rel_anchor_pos = self.init_robot_state[1].apply(self.init_robot_state[0] + rel_anchor_pos)
         #rel_anchor_orn = (self.init_robot_state[1] * Rotation.from_quat(rel_anchor_orn)).as_quat()
         control_signals = {}
-        control_signals["command"] = np.hstack([ref_joint_pos, ref_joint_vel])
+        if hasattr(self, "obs_queue"):
+            this_cmd = np.stack([ref_joint_pos, ref_joint_vel])
+            self.obs_queue.push(this_cmd)
+            cmd = self.obs_queue.get_traj()
+            self.delay_queue.push(np.hstack([ref_anchor_pos, ref_anchor_orn]))
+            ref_anchor_pos, ref_anchor_orn = self.delay_queue[1][:3], self.delay_queue[1][3:7]
+        else:
+            cmd = [ref_joint_pos, ref_joint_vel]
+        
+        control_signals["command"] = np.hstack(cmd).flatten()
+        print(control_signals["command"])
         anchor_rot_inv = Rotation.from_quat(robot_state.root_orn).inv()
         control_signals["motion_anchor_pos_b"] = anchor_rot_inv.apply(rel_anchor_pos - robot_state.root_pos)
         control_signals["motion_anchor_ori_b"] = (anchor_rot_inv * Rotation.from_quat(rel_anchor_orn)).as_matrix()[:,:2].flatten()
