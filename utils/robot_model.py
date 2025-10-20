@@ -174,6 +174,7 @@ class KinematicsModel:
                 self.root_pos[2] = z
                 # self.pos_filter.updateSlam(self.root_pos, timestamp=self.t)
                 self.pos_filter.updateSlam(self.root_pos)
+                root_pos_slam = self.root_pos
             # self.pos_filter.updateOdo(root_vel, timestamp=self.t)
             self.pos_filter.updateOdo(root_vel, z)
             self.t += 0.02

@@ -276,6 +276,7 @@ class MujocoRobot:
             self.control_var[:29] = target_q.copy()
 
     def release_robot(self):
+        self.maintain_state(self.init_q)
         with self.control_lock:
             self.control_var[29] = 200.0
 
@@ -295,6 +296,7 @@ class MujocoRobot:
 
     def maintain_state(self, q):
         self.pd_control(q)
+        self.init_q = q.copy()
         input("Press Enter to continue...")
         
     def damping_state(self):

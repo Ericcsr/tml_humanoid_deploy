@@ -1,5 +1,8 @@
 from argparse import ArgumentParser
 import numpy as np
+import redis
+import pickle
+from utils.redis_utils import REDIS_IP, REDIS_PORT
 from scipy.spatial.transform import Rotation
 from rl_policy import RLBMPolicy
 
@@ -28,7 +31,8 @@ def heading_zup(quat):
 def main(env, policy, config):
     
     if config["use_root_state"] and config.get("use_odom", False):
-        kin_model = KinematicsModel(mocap_link_name="torso_link" if config["use_sim"] else "mid360_link", use_slam=config["use_slam"], visualize=False)
+        # kin_model = KinematicsModel(mocap_link_name="torso_link" if config["use_sim"] else "mid360_link", use_slam=config["use_slam"], visualize=False)
+        redis_client = redis.Redis(host=REDIS_IP, port=REDIS_PORT, db=0)
 
     env.set_robot_state(policy.get_q_init())
     env.maintain_state(policy.get_q_init())
@@ -37,6 +41,13 @@ def main(env, policy, config):
 
     robot_state = G1RobotState()
 
+    robot_state.q, robot_state.dq, robot_state.imu_quat, robot_state.omega = env.get_robot_state()
+    redis_client.set("proprio_data", pickle.dumps(np.hstack((
+                    robot_state.q,
+                    robot_state.dq,
+                    robot_state.omega,
+                    robot_state.imu_quat,
+    ))))
 
     env.release_robot()  # let the robot move
     init = False
@@ -44,12 +55,22 @@ def main(env, policy, config):
         robot_state.q, robot_state.dq, robot_state.imu_quat, robot_state.omega = env.get_robot_state()
         if config["use_root_state"]:
             if config.get("use_odom", False):
-                robot_state.root_pos, robot_state.root_orn, robot_state.root_vel = kin_model.update_root_state(
-                    q=robot_state.q,
-                    dq=robot_state.dq,
-                    imu_quat=robot_state.imu_quat,
-                    omega=robot_state.omega,
-                )
+                redis_client.set("proprio_data", pickle.dumps(np.hstack((
+                    robot_state.q,
+                    robot_state.dq,
+                    robot_state.omega,
+                    robot_state.imu_quat,
+                ))))
+                root_data = pickle.loads(redis_client.get("root_data"))
+                robot_state.root_pos = root_data[:3]
+                robot_state.root_orn = root_data[3:7]
+                robot_state.root_vel = root_data[7:10]
+                # robot_state.root_pos, robot_state.root_orn, robot_state.root_vel = kin_model.update_root_state(
+                #     q=robot_state.q,
+                #     dq=robot_state.dq,
+                #     imu_quat=robot_state.imu_quat,
+                #     omega=robot_state.omega,
+                # )
             else:
                 robot_state.root_pos, robot_state.root_orn, robot_state.root_vel = env.get_root_state()
                 robot_state.anchor_pos, robot_state.anchor_orn = env.get_anchor_state()

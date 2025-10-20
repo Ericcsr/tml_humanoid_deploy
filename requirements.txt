@@ -3,3 +3,4 @@ scipy
 pybullet
 onnxruntime
 torch
+redis
