@@ -333,6 +333,9 @@ class MujocoRobot:
         self.process.terminate()
         self.process.join()
 
+    def get_start_ticker(self):
+        return True
+
 
 if __name__ == "__main__":
     import yaml

@@ -22,7 +22,7 @@ from unitree_sdk2py.utils.crc import CRC  # type: ignore
 
 from utils.robot_utils import create_damping_cmd, create_zero_cmd, init_cmd_hg, MotorMode, RemoteController, KeyMap
 
-STOP_BUTTON = [KeyMap.select, KeyMap.B, KeyMap.X, KeyMap.Y, KeyMap.up, KeyMap.right, KeyMap.down, KeyMap.left]
+STOP_BUTTON = [KeyMap.select]
 
 class UnitreeRobot:
     def __init__(self, 
@@ -58,6 +58,7 @@ class UnitreeRobot:
         self.wait_for_low_state()
         init_cmd_hg(self.low_cmd, self.mode_machine_, self.mode_pr_)
         self.terminated = False
+        self.ticker_started = False
 
     def LowStateHgHandler(self, msg: LowStateHG):
         self.low_state = msg
@@ -181,3 +182,10 @@ class UnitreeRobot:
     
     def release_robot(self):
         pass
+
+    def get_start_ticker(self):
+        if self.remote_controller.button[KeyMap.start] == 1 and not self.ticker_started:
+            self.ticker_started = True
+        elif self.remote_controller.button[KeyMap.B] == 1 and self.ticker_started:
+            self.ticker_started = False
+        return self.ticker_started

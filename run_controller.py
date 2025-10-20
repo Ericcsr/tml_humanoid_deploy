@@ -1,5 +1,6 @@
 from argparse import ArgumentParser
 import numpy as np
+from scipy.spatial.transform import Rotation
 from rl_policy import RLBMPolicy
 
 from utils.params import DEFAULT_POSE, ACTION_SCALE, ISAAC_TO_MUJOCO
@@ -7,6 +8,22 @@ from utils.robot_utils import Rate
 from utils.robot_states import G1RobotState
 
 from utils.robot_model import KinematicsModel
+
+def rotatepoint(q, v):
+    # q_v = [v[0], v[1], v[2], 0]
+    # return quatmultiply(quatmultiply(q, q_v), quatconj(q))[:-1]
+    #
+    # https://fgiesen.wordpress.com/2019/02/09/rotating-a-single-vector-using-a-quaternion/
+    q_r = q[3:4]
+    q_xyz = q[:3]
+    t = 2 * np.cross(q_xyz, v)
+    return v + q_r * t + np.cross(q_xyz, t)
+
+def heading_zup(quat):
+    ref_dir = np.zeros_like(quat[:3])
+    ref_dir[0] = 1
+    ref_dir = rotatepoint(quat, ref_dir)
+    return np.arctan2(ref_dir[1], ref_dir[0])
 
 def main(env, policy, config):
     
@@ -22,6 +39,7 @@ def main(env, policy, config):
 
 
     env.release_robot()  # let the robot move
+    init = False
     while True:
         robot_state.q, robot_state.dq, robot_state.imu_quat, robot_state.omega = env.get_robot_state()
         if config["use_root_state"]:
@@ -35,11 +53,17 @@ def main(env, policy, config):
             else:
                 robot_state.root_pos, robot_state.root_orn, robot_state.root_vel = env.get_root_state()
                 robot_state.anchor_pos, robot_state.anchor_orn = env.get_anchor_state()
-        
+        else:
+            if not init:
+                init_orn = robot_state.imu_quat
+                init_heading = heading_zup(init_orn)
+                init_heading_rot = Rotation.from_euler("z", init_heading)
+                init = True
+            robot_state.root_orn = (init_heading_rot.inv() * Rotation.from_quat(robot_state.imu_quat)).as_quat()
         control_signals = policy.prepare_control_signals(robot_state)
         obs = policy.prepare_obs(robot_state, control_signals) # Should be reference motion.
 
-        action = policy.get_action(obs)
+        action = policy.get_action(obs, start_ticker=env.get_start_ticker())
         robot_state.last_action = action.copy() # save last action
 
         scaled_action = action[ISAAC_TO_MUJOCO] * policy.action_scale + policy.default_value["q"][ISAAC_TO_MUJOCO]

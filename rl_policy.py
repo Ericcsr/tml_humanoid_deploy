@@ -98,7 +98,7 @@ class RLBMPolicy(RLBasePolicy):
             cmd = [ref_joint_pos, ref_joint_vel]
         
         control_signals["command"] = np.hstack(cmd).flatten()
-        print(control_signals["command"])
+        #print(control_signals["command"])
         anchor_rot_inv = Rotation.from_quat(robot_state.root_orn).inv()
         control_signals["motion_anchor_pos_b"] = anchor_rot_inv.apply(rel_anchor_pos - robot_state.root_pos)
         control_signals["motion_anchor_ori_b"] = (anchor_rot_inv * Rotation.from_quat(rel_anchor_orn)).as_matrix()[:,:2].flatten()
@@ -117,10 +117,13 @@ class RLBMPolicy(RLBasePolicy):
                 obs.append(control_signals[key])
         return np.concatenate(obs).reshape(1,-1)
     
-    def get_action(self, obs):
+    def get_action(self, obs, start_ticker=False):
         assert obs.shape == self.input_shape
         ort_inputs = {"obs": obs.astype(np.float32), 
                       "time_step": np.array([[0.0]], dtype=np.float32)}
         ort_outs = self.session.run(None, ort_inputs)
-        self.ticker += 1
+        if start_ticker:
+            self.ticker += 1
+        elif self.ticker > 0:
+            self.ticker = 0
         return ort_outs[0].flatten()
