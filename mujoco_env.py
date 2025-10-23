@@ -276,7 +276,6 @@ class MujocoRobot:
             self.control_var[:29] = target_q.copy()
 
     def release_robot(self):
-        self.maintain_state(self.init_q)
         with self.control_lock:
             self.control_var[29] = 200.0
 

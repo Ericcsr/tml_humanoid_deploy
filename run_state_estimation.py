@@ -22,10 +22,15 @@ kin_model = KinematicsModel(mocap_link_name="torso_link" if args.use_sim else "m
                             use_slam=args.use_slam, visualize=args.visualize)
 redis_client = kin_model.redis_client
 
-rate = Rate(50)  # 100 Hz
+rate = Rate(50)  # 50 Hz
+
+redis_client.set("proprio_data", None)
 
 while True:
     proprio_data = pickle.loads(redis_client.get("proprio_data"))
+    if proprio_data is None:
+        rate.sleep()
+        continue
     #breakpoint()
     root_pos, root_orn, root_vel = kin_model.update_root_state(
         q=proprio_data[:29], 
