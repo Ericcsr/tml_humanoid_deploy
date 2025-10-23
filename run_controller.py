@@ -41,13 +41,14 @@ def main(env, policy, config):
 
     robot_state = G1RobotState()
 
-    robot_state.q, robot_state.dq, robot_state.imu_quat, robot_state.omega = env.get_robot_state()
-    redis_client.set("proprio_data", pickle.dumps(np.hstack((
-                    robot_state.q,
-                    robot_state.dq,
-                    robot_state.omega,
-                    robot_state.imu_quat,
-    ))))
+    if config["use_root_state"]:
+        robot_state.q, robot_state.dq, robot_state.imu_quat, robot_state.omega = env.get_robot_state()
+        redis_client.set("proprio_data", pickle.dumps(np.hstack((
+                        robot_state.q,
+                        robot_state.dq,
+                        robot_state.omega,
+                        robot_state.imu_quat,
+        ))))
 
     env.release_robot()  # let the robot move
     init = False
