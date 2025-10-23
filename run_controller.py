@@ -1,6 +1,7 @@
 from argparse import ArgumentParser
 import numpy as np
 import redis
+import time
 import pickle
 from utils.redis_utils import REDIS_IP, REDIS_PORT
 from scipy.spatial.transform import Rotation
@@ -52,7 +53,11 @@ def main(env, policy, config):
 
     env.release_robot()  # let the robot move
     init = False
+    if config["use_root_state"]:
+        while redis_client.get("root_data") is None:
+            rate.sleep()
     while True:
+        
         robot_state.q, robot_state.dq, robot_state.imu_quat, robot_state.omega = env.get_robot_state()
         if config["use_root_state"]:
             if config.get("use_odom", False):
@@ -66,12 +71,6 @@ def main(env, policy, config):
                 robot_state.root_pos = root_data[:3]
                 robot_state.root_orn = root_data[3:7]
                 robot_state.root_vel = root_data[7:10]
-                # robot_state.root_pos, robot_state.root_orn, robot_state.root_vel = kin_model.update_root_state(
-                #     q=robot_state.q,
-                #     dq=robot_state.dq,
-                #     imu_quat=robot_state.imu_quat,
-                #     omega=robot_state.omega,
-                # )
             else:
                 robot_state.root_pos, robot_state.root_orn, robot_state.root_vel = env.get_root_state()
                 robot_state.anchor_pos, robot_state.anchor_orn = env.get_anchor_state()
@@ -84,12 +83,14 @@ def main(env, policy, config):
             robot_state.root_orn = (init_heading_rot.inv() * Rotation.from_quat(robot_state.imu_quat)).as_quat()
         control_signals = policy.prepare_control_signals(robot_state)
         obs = policy.prepare_obs(robot_state, control_signals) # Should be reference motion.
-
+        
         action = policy.get_action(obs, start_ticker=env.get_start_ticker())
+        
         robot_state.last_action = action.copy() # save last action
 
         scaled_action = action[ISAAC_TO_MUJOCO] * policy.action_scale + policy.default_value["q"][ISAAC_TO_MUJOCO]
         env.step_robot(scaled_action)
+        
         rate.sleep()
 
 if __name__ == "__main__":

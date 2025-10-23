@@ -1,7 +1,7 @@
 import numpy as np
 import onnxruntime
 import torch
-
+import time
 from utils.params import MUJOCO_TO_ISAAC, ISAAC_TO_MUJOCO
 from utils.math_utils import yaw_quat
 from utils.storage_utils import ObsQueue
@@ -49,9 +49,7 @@ class RLBMPolicy(RLBasePolicy):
         self.ref_motion = np.load(ref_motion_path)
         self.init_root_pos = self.ref_motion["body_pos_w"][0,0]
         self.init_root_pos[2] = 0  # set initial height to 0
-        self.init_root_heading = Rotation.from_quat(yaw_quat(self.ref_motion["body_quat_w"][0,0])[[1,2,3,0]])
-
-        self.init_robot_state = None
+        self.init_root_heading_inv = Rotation.from_quat(yaw_quat(self.ref_motion["body_quat_w"][0,0])[[1,2,3,0]]).inv()
 
         self.default_value = {
             "q": np.array([float(x) for x in self.meta_data["default_joint_pos"].split(",")]),
@@ -63,6 +61,10 @@ class RLBMPolicy(RLBasePolicy):
         else:
             self.action_scale = self.action_scale[ISAAC_TO_MUJOCO]
         self.motion_length = self.ref_motion["joint_pos"].shape[0]
+        self.ref_q_pos = self.ref_motion["joint_pos"].copy()
+        self.ref_q_vel = self.ref_motion["joint_vel"].copy()
+        self.ref_anchor_poses = self.ref_motion["body_pos_w"][:,0].copy()
+        self.ref_anchor_orns = self.ref_motion["body_quat_w"][:,0][:,[1,2,3,0]].copy()
         print("Motion length:", self.motion_length)
         self.anchor_id = 0
         if lookahead_steps != 1:
@@ -75,18 +77,13 @@ class RLBMPolicy(RLBasePolicy):
 
     def prepare_control_signals(self, robot_state):
         mid = self.ticker if self.ticker < self.motion_length else self.motion_length-1
-        ref_joint_pos = self.ref_motion["joint_pos"][mid] # don't matter that much
-        ref_joint_vel = self.ref_motion["joint_vel"][mid]
-        ref_anchor_pos = self.ref_motion["body_pos_w"][mid, 0]
-        ref_anchor_orn = self.ref_motion["body_quat_w"][mid, 0][[1,2,3,0]]
+        ref_joint_pos = self.ref_q_pos[mid]
+        ref_joint_vel = self.ref_q_vel[mid]
+        ref_anchor_pos = self.ref_anchor_poses[mid]
+        ref_anchor_orn = self.ref_anchor_orns[mid]
         # compute relative to initial frame
-        if self.init_robot_state is None:
-            self.init_robot_state = (robot_state.root_pos.copy(), Rotation.from_quat(robot_state.root_orn.copy()))
-
-        rel_anchor_pos = self.init_root_heading.inv().apply(ref_anchor_pos - self.init_root_pos)
-        rel_anchor_orn = (self.init_root_heading.inv() * Rotation.from_quat(ref_anchor_orn)).as_quat()
-        #rel_anchor_pos = self.init_robot_state[1].apply(self.init_robot_state[0] + rel_anchor_pos)
-        #rel_anchor_orn = (self.init_robot_state[1] * Rotation.from_quat(rel_anchor_orn)).as_quat()
+        rel_anchor_pos = self.init_root_heading_inv.apply(ref_anchor_pos - self.init_root_pos)
+        rel_anchor_orn = (self.init_root_heading_inv * Rotation.from_quat(ref_anchor_orn)).as_quat()
         control_signals = {}
         if hasattr(self, "obs_queue"):
             this_cmd = np.stack([ref_joint_pos, ref_joint_vel])
