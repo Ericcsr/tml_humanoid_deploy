@@ -14,7 +14,7 @@ from scripts.run_controller import run_controller
 def main():
     parser = ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to the configuration file.")
-    parser.add_argument("--use_odom", action="store_true", help="Use odometry for state estimation.")
+    parser.add_argument("--use_odom", action="store_true",help="Use odometry for state estimation.")
     parser.add_argument("--net", type=str, required=True, help="Network interface for the robot controller.")
     args = parser.parse_args()
     
