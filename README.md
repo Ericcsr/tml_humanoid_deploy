@@ -15,14 +15,16 @@ python run_controller.py --use_sim --config exported_policies/sirui_test/experim
 
 ## Run sim2real(sim) with foot odometer as velocity and position estimator
 ```
+# Terminal 1
 python run_controller.py (--use_sim) --config exported_policies/sirui_test/experiment.yaml --use_odom
-python run_controller.py (--use_sim) --config exported_policies/yanjie_test/experiment.yaml --use_odom
+# Terminal 2
+python run_state_estimation.py --use_sim --visualize
 ```
-
+Note sim2real requires running lidar slam code [link](https://github.com/Ericcsr/G1_localization)
 ## Run sim2real(sim) with SLAM fusing with foot odom
 ```
 python run_controller.py (--use_sim) --config exported_policies/sirui_test/experiment.yaml --use_odom --use_slam
-python run_controller.py (--use_sim) --config exported_policies/yanjie_test/experiment.yaml --use_odom --use_slam
+python run_state_estimation.py --use_sim --visualize --use_slam
 ```
 
 
