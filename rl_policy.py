@@ -99,6 +99,7 @@ class RLBMPolicy(RLBasePolicy):
         anchor_rot_inv = Rotation.from_quat(robot_state.root_orn).inv()
         control_signals["motion_anchor_pos_b"] = anchor_rot_inv.apply(rel_anchor_pos - robot_state.root_pos)
         control_signals["motion_anchor_ori_b"] = (anchor_rot_inv * Rotation.from_quat(rel_anchor_orn)).as_matrix()[:,:2].flatten()
+        control_signals["projected_gravity"] = anchor_rot_inv.apply(np.array([0,0,-1]))
         return control_signals
 
     def prepare_obs(self, robot_state, control_signals):
@@ -116,8 +117,8 @@ class RLBMPolicy(RLBasePolicy):
     
     def get_action(self, obs, start_ticker=False):
         assert obs.shape == self.input_shape
-        ort_inputs = {"obs": obs.astype(np.float32), 
-                      "time_step": np.array([[0.0]], dtype=np.float32)}
+        ort_inputs = {"obs": obs.astype(np.float32)}
+                      #"time_step": np.array([[0.0]], dtype=np.float32)}
         ort_outs = self.session.run(None, ort_inputs)
         if start_ticker:
             self.ticker += 1
