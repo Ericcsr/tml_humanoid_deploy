@@ -5,7 +5,7 @@ import time
 import pickle
 from utils.redis_utils import REDIS_IP, REDIS_PORT
 from scipy.spatial.transform import Rotation
-from rl_policy import RLBMPolicy
+from rl_policy import RLBMPolicy, RL3ptPolicy
 
 from utils.params import DEFAULT_POSE, ACTION_SCALE, ISAAC_TO_MUJOCO
 from utils.robot_utils import Rate
@@ -32,7 +32,6 @@ def heading_zup(quat):
 def main(env, policy, config):
     
     if config["use_root_state"] and config.get("use_odom", False):
-        # kin_model = KinematicsModel(mocap_link_name="torso_link" if config["use_sim"] else "mid360_link", use_slam=config["use_slam"], visualize=False)
         redis_client = redis.Redis(host=REDIS_IP, port=REDIS_PORT, db=0)
 
     env.set_robot_state(policy.get_q_init())
@@ -98,7 +97,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True, help="Path to the configuration file.")
     parser.add_argument("--use_sim", action="store_true", help="Use simulation environment instead of real robot.")
     parser.add_argument("--use_odom", action="store_true", help="Use odometry for state estimation.")
-    parser.add_argument("--use_slam", action="store_true", help="Use lidar for state estimation.")
+    parser.add_argument("--vr", action="store_true", default=False, help="Use 3-point VR controller.")
     parser.add_argument("--net", type=str, required=False, help="Network interface for the robot controller.")
     args = parser.parse_args()
 
@@ -110,7 +109,6 @@ if __name__ == "__main__":
     # override config with command line args
     config["use_sim"] = args.use_sim
     config["use_odom"] = args.use_odom
-    config["use_slam"] = args.use_slam
 
     if args.use_sim:
         from mujoco_env import MujocoRobot
@@ -121,7 +119,11 @@ if __name__ == "__main__":
 
     lookahead_steps = config.get("lookahead_steps",1)
     lookahead_frame_skips = config.get("lookahead_frame_skips",1)
-    policy = RLBMPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
-                        lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips)
+    if args.vr:
+        policy = RL3ptPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
+                            lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips)
+    else:
+        policy = RLBMPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
+                            lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips)
 
     main(env, policy, config)

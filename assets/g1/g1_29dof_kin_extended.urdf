@@ -685,7 +685,7 @@
       <inertia ixx="0.004085051" ixy="-2.543E-06" ixz="-6.9455E-05" iyy="0.004185212" iyz="-3.726E-06" izz="0.001807911"/>
     </inertial>
     <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <origin xyz="0 0 0" rpy="0 0 1.57"/>
       <geometry>
         <mesh filename="meshes/head_link_tml.STL"/>
       </geometry>
@@ -694,7 +694,7 @@
       </material>
     </visual>
     <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <origin xyz="0 0 0" rpy="0 0 1.57"/>
       <geometry>
         <mesh filename="meshes/head_link_tml.STL"/>
       </geometry>
