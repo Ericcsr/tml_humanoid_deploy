@@ -5,7 +5,7 @@ import time
 import pickle
 from utils.redis_utils import REDIS_IP, REDIS_PORT
 from scipy.spatial.transform import Rotation
-from rl_policy import RLBMPolicy, RL3ptPolicy
+from rl_policy import RLBMPolicy, RL3ptPolicy, RLCHIPPolicy
 
 from utils.params import DEFAULT_POSE, ACTION_SCALE, ISAAC_TO_MUJOCO
 from utils.robot_utils import Rate
@@ -98,6 +98,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_sim", action="store_true", help="Use simulation environment instead of real robot.")
     parser.add_argument("--use_odom", action="store_true", help="Use odometry for state estimation.")
     parser.add_argument("--vr", action="store_true", default=False, help="Use 3-point VR controller.")
+    parser.add_argument("--chip", action="store_true", default=False, help="Use local chip model.")
     parser.add_argument("--net", type=str, required=False, help="Network interface for the robot controller.")
     args = parser.parse_args()
 
@@ -122,6 +123,10 @@ if __name__ == "__main__":
     if args.vr:
         policy = RL3ptPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
                             lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips)
+    elif args.chip:
+        policy = RLCHIPPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
+                            lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
+                            hist_names=config.get("history_names", []), hist_length=config.get("history_length", 1))
     else:
         policy = RLBMPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
                             lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips)

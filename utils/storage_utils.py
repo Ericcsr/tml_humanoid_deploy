@@ -21,3 +21,20 @@ class ObsQueue:
 
     def get_traj(self):
         return list(reversed(self._queue[::-self.stride]))
+    
+
+class HistoryBuffer:
+    def __init__(self, history_length, obs_names, flatten=True):
+        self.history_length = history_length
+        self.flatten = flatten
+        self.buffer_dict = {}
+        for name in obs_names:
+            self.buffer_dict[name] = ObsQueue(history_length,stride=1)
+
+    def add(self, name, obs):
+        self.buffer_dict[name].push(obs)
+
+    def get_history(self, name):
+        if self.flatten:
+            return np.hstack(self.buffer_dict[name].get_traj()).flatten()
+        return self.buffer_dict[name].get_traj()
