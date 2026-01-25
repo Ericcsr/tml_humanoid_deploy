@@ -77,10 +77,7 @@ class RLBasePolicy:
 class RLBMPolicy(RLBasePolicy):
     def __init__(self, onnx_model_path, obs_names, ref_motion_path, lookahead_steps=1, lookahead_frame_skips=1):
         super().__init__(onnx_model_path, obs_names)
-        self.ref_motion = np.load(ref_motion_path)
-        self.init_root_pos = self.ref_motion["body_pos_w"][0,0]
-        self.init_root_pos[2] = 0  # set initial height to 0
-        self.init_root_heading_inv = Rotation.from_quat(yaw_quat(self.ref_motion["body_quat_w"][0,0])[[1,2,3,0]]).inv()
+        
 
         self.default_value = {
             "q": np.array([float(x) for x in self.meta_data["default_joint_pos"].split(",")]),
@@ -91,6 +88,11 @@ class RLBMPolicy(RLBasePolicy):
             self.action_scale = np.ones(29) * self.action_scale
         else:
             self.action_scale = self.action_scale[ISAAC_TO_MUJOCO]
+        
+        self.ref_motion = np.load(ref_motion_path)
+        self.init_root_pos = self.ref_motion["body_pos_w"][0,0]
+        self.init_root_pos[2] = 0  # set initial height to 0
+        self.init_root_heading_inv = Rotation.from_quat(yaw_quat(self.ref_motion["body_quat_w"][0,0])[[1,2,3,0]]).inv()
         self.motion_length = self.ref_motion["joint_pos"].shape[0]
         self.ref_q_pos = self.ref_motion["joint_pos"].copy()
         self.ref_q_vel = self.ref_motion["joint_vel"].copy()
@@ -106,12 +108,16 @@ class RLBMPolicy(RLBasePolicy):
     def get_q_init(self):
         return self.ref_motion["joint_pos"][0, ISAAC_TO_MUJOCO]
 
-    def prepare_control_signals(self, robot_state):
+    def _control_signals_from_motion(self):
         mid = self.ticker if self.ticker < self.motion_length else self.motion_length-1
         ref_joint_pos = self.ref_q_pos[mid]
         ref_joint_vel = self.ref_q_vel[mid]
         ref_anchor_pos = self.ref_anchor_poses[mid]
         ref_anchor_orn = self.ref_anchor_orns[mid]
+        return ref_joint_pos, ref_joint_vel, ref_anchor_pos, ref_anchor_orn
+
+    def prepare_control_signals(self, robot_state):
+        ref_joint_pos, ref_joint_vel, ref_anchor_pos, ref_anchor_orn = self._control_signals_from_motion()
         # compute relative to initial frame
         rel_anchor_pos = self.init_root_heading_inv.apply(ref_anchor_pos - self.init_root_pos)
         rel_anchor_orn = (self.init_root_heading_inv * Rotation.from_quat(ref_anchor_orn)).as_quat()
