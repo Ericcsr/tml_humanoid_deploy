@@ -12,6 +12,7 @@ parser.add_argument("--use_sim", action="store_true", default=False,
                     help="Whether to use simulation or real robot")
 parser.add_argument("--use_slam", action="store_true", default=False,
                     help="Whether to use SLAM for root state estimation")
+parser.add_argument("--use_acc", action="store_true", default=False)
 parser.add_argument("--visualize", action="store_true", default=False,
                     help="Whether to visualize the kinematics model")
 args = parser.parse_args()
@@ -63,7 +64,7 @@ class LowPassFilter:
         return self.state
 
 kin_model = KinematicsModel(mocap_link_name="torso_link" if args.use_sim else "mid360_link", 
-                            use_slam=args.use_slam, visualize=args.visualize)
+                            use_slam=args.use_slam, visualize=args.visualize, use_acc=args.use_acc)
 redis_client = kin_model.redis_client
 
 rate = Rate(50)  # 50 Hz
@@ -76,13 +77,27 @@ while True:
         rate.sleep()
         continue
     proprio_data = pickle.loads(proprio_data)
-    #breakpoint()
-    root_pos, root_orn, root_vel = kin_model.update_root_state(
-        q=proprio_data[:29], 
-        dq=proprio_data[29:58], 
-        omega=proprio_data[58:61],
-        imu_quat=proprio_data[61:65]
-    )
+    if not args.use_acc:
+        root_pos, root_orn, root_vel = kin_model.update_root_state(
+            q=proprio_data[:29], 
+            dq=proprio_data[29:58], 
+            omega=proprio_data[58:61],
+            imu_quat=proprio_data[61:65]
+        )
+    else:
+        ddq = pickle.loads(redis_client.get("ddq"))
+        root_a = pickle.loads(redis_client.get("root_a"))
+        tau = pickle.loads(redis_client.get("tau"))
+        print(root_a)
+        root_pos, root_orn, root_vel = kin_model.update_root_state(
+            q=proprio_data[:29], 
+            dq=proprio_data[29:58], 
+            omega=proprio_data[58:61],
+            imu_quat=proprio_data[61:65],
+            ddq = ddq,
+            root_a = root_a,
+            tau = tau
+        )
     root_pos = root_pos_low_pass.filter(root_pos)
     root_data = np.hstack((root_pos, root_orn, root_vel))
     redis_client.set("root_data", pickle.dumps(root_data))
