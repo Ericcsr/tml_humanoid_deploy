@@ -88,7 +88,7 @@ while True:
         ddq = pickle.loads(redis_client.get("ddq"))
         root_a = pickle.loads(redis_client.get("root_a"))
         tau = pickle.loads(redis_client.get("tau"))
-        print(root_a)
+        #print(root_a)
         root_pos, root_orn, root_vel = kin_model.update_root_state(
             q=proprio_data[:29], 
             dq=proprio_data[29:58], 

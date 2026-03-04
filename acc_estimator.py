@@ -79,22 +79,23 @@ def main(verbose=False):
             # Extract torques and linear acceleration directly from SDK state
             # Efficiently pull motor torques
             tau = np.array([robot.low_state.motor_state[i].tau_est for i in range(29)], dtype=np.float32)
-            lin_acc = np.array(robot.low_state.imu_state.accelerometer, dtype=np.float32)
+            lin_acc = -np.array(robot.low_state.imu_state.accelerometer, dtype=np.float32)
             
             # Estimate accelerations (500Hz)
             ddq, imu_alpha = estimator.update(dq, omega)
 
             # 3. Redis Broadcast (50Hz)
             if counter % broadcast_every == 0:
-                payload = {
-                    "joint_acc": ddq,
-                    "joint_tau": tau,
-                    "root_lin_acc": lin_acc,
-                    "root_ang_acc": imu_alpha,
-                    "ts": start_loop_time
-                }
-                r.set("robot_accel_data", pickle.dumps(payload))
-            
+                # payload = {
+                #     "joint_acc": ddq,
+                #     "joint_tau": tau,
+                #     "root_lin_acc": lin_acc,
+                #     "root_ang_acc": imu_alpha,
+                #     "ts": start_loop_time
+                # }
+                r.set("root_a", pickle.dumps(np.hstack([lin_acc, imu_alpha])))
+                r.set("ddq", pickle.dumps(ddq))
+                r.set("tau", pickle.dumps(tau))
             counter += 1
             
             # Precise sleep to maintain 500Hz
@@ -110,4 +111,4 @@ def main(verbose=False):
 
 if __name__ == "__main__":
     # Set verbose=True only for debugging
-    main(verbose=False)
+    main(verbose=True)
