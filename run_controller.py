@@ -3,6 +3,7 @@ import numpy as np
 import redis
 import time
 import pickle
+from multiprocessing import Value
 from utils.redis_utils import REDIS_IP, REDIS_PORT
 from scipy.spatial.transform import Rotation
 from rl_policy import RLBMPolicy, RL3ptPolicy, RLCHIPPolicy
@@ -29,7 +30,41 @@ def heading_zup(quat):
     ref_dir = rotatepoint(quat, ref_dir)
     return np.arctan2(ref_dir[1], ref_dir[0])
 
-def main(env, policy, config):
+def compute_metrics(robot_state, policy, mid, init_offset=None):
+    """Compute per-frame errors between robot and reference.
+    Both use policy's init_root_heading_inv to transform to init-relative frame.
+    When init_offset is provided (from frame 0), we subtract it to measure tracking error
+    rather than absolute offset (robot may start at different position than reference).
+    For trajectory: use per-frame ref-frame alignment to remove heading-induced xy drift.
+    """
+    ref_q = policy.ref_q_pos[mid][ISAAC_TO_MUJOCO]
+    ref_anchor_pos = policy.ref_anchor_poses[mid]
+    ref_anchor_orn = policy.ref_anchor_orns[mid]
+
+    # Same transform as policy: both to init-relative frame (origin at init_root_pos, yaw-aligned)
+    robot_rel_pos = policy.init_root_heading_inv.apply(robot_state.root_pos - policy.init_root_pos)
+    ref_rel_pos = policy.init_root_heading_inv.apply(ref_anchor_pos - policy.init_root_pos)
+    robot_rel_orn = (policy.init_root_heading_inv * Rotation.from_quat(robot_state.root_orn)).as_quat()
+    ref_rel_orn = (policy.init_root_heading_inv * Rotation.from_quat(ref_anchor_orn)).as_quat()
+
+    # First-frame alignment: subtract initial pos offset from robot only (align robot to ref at frame 0)
+    if init_offset is not None:
+        pos_offset, (robot_orn_0, ref_orn_0) = init_offset[0], init_offset[1]
+        robot_rel_pos = robot_rel_pos - pos_offset
+        # Orientation error = angle between robot's pose change and ref's pose change (from frame 0)
+        robot_delta = Rotation.from_quat(robot_orn_0).inv() * Rotation.from_quat(robot_rel_orn)
+        ref_delta = Rotation.from_quat(ref_orn_0).inv() * Rotation.from_quat(ref_rel_orn)
+        root_orn_err = (robot_delta * ref_delta.inv()).magnitude()
+    else:
+        root_orn_err = (Rotation.from_quat(robot_rel_orn) * Rotation.from_quat(ref_rel_orn).inv()).magnitude()
+
+    joint_err = np.mean(np.abs(robot_state.q - ref_q))
+    root_pos_err = np.linalg.norm(robot_rel_pos - ref_rel_pos)
+
+    return joint_err, root_pos_err, root_orn_err, robot_rel_pos.copy(), ref_rel_pos.copy()
+
+
+def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
     
     if config["use_root_state"] and config.get("use_odom", False):
         redis_client = redis.Redis(host=REDIS_IP, port=REDIS_PORT, db=0)
@@ -41,7 +76,7 @@ def main(env, policy, config):
 
     robot_state = G1RobotState()
 
-    if config["use_root_state"]:
+    if config["use_root_state"] and config.get("use_odom", False):
         robot_state.q, robot_state.dq, robot_state.imu_quat, robot_state.omega = env.get_robot_state()
         redis_client.set("proprio_data", pickle.dumps(np.hstack((
                         robot_state.q,
@@ -52,9 +87,17 @@ def main(env, policy, config):
 
     env.release_robot()  # let the robot move
     init = False
-    if config["use_root_state"]:
+    if config["use_root_state"] and config.get("use_odom", False):
         while redis_client.get("root_data") is None:
             rate.sleep()
+
+    # Accumulators for metrics (when --metric enabled)
+    joint_errors, root_pos_errors, root_orn_errors = [], [], []
+    robot_traj, ref_traj = [], []  # root trajectories for visualization
+    motion_length = policy.motion_length
+    init_offset = None  # (pos_offset, (robot_orn_0, ref_orn_0)) from frame 0 for first-frame alignment
+    heading_align_rot = None  # rotation to align robot's initial heading with ref (removes heading-induced xy drift)
+
     while True:
         
         robot_state.q, robot_state.dq, robot_state.imu_quat, robot_state.omega = env.get_robot_state()
@@ -84,7 +127,57 @@ def main(env, policy, config):
         obs = policy.prepare_obs(robot_state, control_signals) # Should be reference motion.
         
         action = policy.get_action(obs, start_ticker=env.get_start_ticker())
-        
+
+        # Sync ticker to ref motion visualizer (when use_sim)
+        if ticker_value is not None:
+            ticker_value.value = float(policy.ticker)
+
+        # Compute metrics: robot state is from start of loop (after prev step); ticker was just incremented.
+        # So robot = result of (ticker-1) steps, ref frame (ticker-1) is the one we used for that action.
+        # Requires use_root_state for root_pos/root_orn.
+        if compute_metrics_flag and config["use_root_state"]:
+            mid = max(0, policy.ticker - 1) if policy.ticker > 0 else 0
+            mid = min(mid, motion_length - 1)
+            # Capture init offset at frame 0 for first-frame alignment (robot may start elsewhere than ref)
+            if mid == 0 and init_offset is None:
+                ref_anchor_pos_0 = policy.ref_anchor_poses[0]
+                ref_anchor_orn_0 = policy.ref_anchor_orns[0]
+                robot_rel_pos_0 = policy.init_root_heading_inv.apply(robot_state.root_pos - policy.init_root_pos)
+                ref_rel_pos_0 = policy.init_root_heading_inv.apply(ref_anchor_pos_0 - policy.init_root_pos)
+                robot_rel_orn_0 = (policy.init_root_heading_inv * Rotation.from_quat(robot_state.root_orn)).as_quat()
+                ref_rel_orn_0 = (policy.init_root_heading_inv * Rotation.from_quat(ref_anchor_orn_0)).as_quat()
+                pos_offset = robot_rel_pos_0 - ref_rel_pos_0
+                init_offset = (pos_offset, (robot_rel_orn_0, ref_rel_orn_0), ref_rel_pos_0)
+                # Heading alignment: rotate robot's displacement so initial heading matches ref (removes xy drift)
+                heading_diff = heading_zup(robot_rel_orn_0) - heading_zup(ref_rel_orn_0)
+                heading_align_rot = Rotation.from_euler("z", -heading_diff)
+            je, rpe, roe, robot_pos, ref_pos = compute_metrics(robot_state, policy, mid, init_offset)
+            joint_errors.append(je)
+            root_pos_errors.append(rpe)
+            root_orn_errors.append(roe)
+            # Apply heading alignment to robot trajectory (robot_pos already has pos_offset applied)
+            if heading_align_rot is not None:
+                _, _, ref_rel_pos_0 = init_offset
+                robot_disp = robot_pos - ref_rel_pos_0
+                robot_pos_aligned = ref_rel_pos_0 + heading_align_rot.apply(robot_disp)
+                robot_traj.append(robot_pos_aligned)
+            else:
+                robot_traj.append(robot_pos)
+            ref_traj.append(ref_pos)
+            if policy.ticker >= motion_length:
+                mean_je = np.mean(joint_errors)
+                # Use same trajectory data as plot (heading-aligned robot vs ref) for printed metric
+                robot_arr = np.array(robot_traj)
+                ref_arr = np.array(ref_traj)
+                mean_rpe = np.mean(np.linalg.norm(robot_arr - ref_arr, axis=1))
+                mean_roe = np.mean(root_orn_errors)
+                print("\n=== Motion Rollout Metrics ===")
+                print(f"  Mean joint error (rad):     {mean_je:.6f}")
+                print(f"  Mean root position error (m): {mean_rpe:.6f}")
+                print(f"  Mean root orientation error (rad): {mean_roe:.6f}")
+                print("==============================\n")
+                return robot_arr, ref_arr
+
         robot_state.last_action = action.copy() # save last action
 
         scaled_action = action[ISAAC_TO_MUJOCO] * policy.action_scale + policy.default_value["q"][ISAAC_TO_MUJOCO]
@@ -100,6 +193,7 @@ if __name__ == "__main__":
     parser.add_argument("--vr", action="store_true", default=False, help="Use 3-point VR controller.")
     parser.add_argument("--chip", action="store_true", default=False, help="Use local chip model.")
     parser.add_argument("--net", type=str, required=False, help="Network interface for the robot controller.")
+    parser.add_argument("--metric", action="store_true", help="Compute mean joint/root errors vs reference during rollout, then exit.")
     args = parser.parse_args()
 
     import yaml
@@ -111,12 +205,31 @@ if __name__ == "__main__":
     config["use_sim"] = args.use_sim
     config["use_odom"] = args.use_odom
 
+    if args.metric and not config.get("use_root_state", False):
+        raise ValueError("--metric requires use_root_state: True in config (for root position/orientation).")
+
     if args.use_sim:
         from mujoco_env import MujocoRobot
+        from ref_motion_visualizer import start_ref_visualizer_process
+
         env = MujocoRobot(config["mujoco_xml_path"], config)
+
+        ticker_value = Value("f", 0.0)
+        # Only start ref motion visualizer when --metric is enabled
+        if args.metric:
+            ref_vis_process = start_ref_visualizer_process(
+                config["mujoco_xml_path"],
+                config["ref_motion_path"],
+                control_dt=config.get("control_dt", 0.02),
+                ticker_value=ticker_value,
+            )
+        else:
+            ref_vis_process = None
     else:
         from real_env import UnitreeRobot
         env = UnitreeRobot(args.net, config)
+        ticker_value = None
+        ref_vis_process = None
 
     lookahead_steps = config.get("lookahead_steps",1)
     lookahead_frame_skips = config.get("lookahead_frame_skips",1)
@@ -131,4 +244,13 @@ if __name__ == "__main__":
         policy = RLBMPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
                             lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips)
 
-    main(env, policy, config)
+    try:
+        result = main(env, policy, config, ticker_value=ticker_value, compute_metrics_flag=args.metric)
+        if result is not None and args.metric:
+            robot_traj, ref_traj = result
+            from trajectory_visualizer import plot_root_trajectories
+            plot_root_trajectories(robot_traj, ref_traj)
+    finally:
+        if ref_vis_process is not None:
+            ref_vis_process.terminate()
+            ref_vis_process.join()

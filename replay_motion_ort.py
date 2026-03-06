@@ -27,7 +27,7 @@ motion = np.load(args.motion)
 
 motion_length = motion["qpos"].shape[0]
 
-fps = 50#float(motion["fps"])
+fps = 30#float(motion["fps"])
 
 init_root_pos = motion["qpos"][0,:3]
 init_root_pos[2] = 0  # set initial height to 0
@@ -35,7 +35,7 @@ init_root_heading = Rotation.from_quat(heading_quat(motion["qpos"][0,3:7][[1,2,3
 frame_id = 13
 while True:
     for i in range(motion_length):
-        joint_pos = motion["qpos"][i,7:]
+        joint_pos = motion["qpos"][i,7:36]
         set_joint_angles(robot, joint_pos)
         rel_root_pos = init_root_heading.inv().apply(motion["qpos"][i,:3] - init_root_pos)
         rel_root_orn = (init_root_heading.inv() * Rotation.from_quat(motion["qpos"][i,3:7][[1,2,3,0]])).as_quat()

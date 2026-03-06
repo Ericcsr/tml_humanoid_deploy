@@ -3,8 +3,39 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 import time
 from argparse import ArgumentParser
-from utils.params import ISAAC_TO_MUJOCO
 from utils.math_utils import heading_quat
+
+ISAAC_TO_MUJOCO = np.array([
+    0,
+    3,
+    6,
+    9,
+    13,
+    17,
+    1,
+    4,
+    7,
+    10,
+    14,
+    18,
+    2,
+    5,
+    8,
+    11,
+    15,
+    19,
+    21,
+    23,
+    25,
+    27,
+    12,
+    16,
+    20,
+    22,
+    24,
+    26,
+    28,
+])
 
 def set_joint_angles(robot_id, joint_angles):
     j = 0
@@ -32,6 +63,8 @@ if "wrist_grasp_label" in motion.keys():
     has_grasp_label = True
 
 motion_length = motion["joint_pos"].shape[0]
+
+print("Motion length:", motion_length)
 
 fps = 50#float(motion["fps"])
 
