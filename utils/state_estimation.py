@@ -311,7 +311,7 @@ class FootOdometer:
         return self.last_velocity.copy(), z  # assume flat ground
 
 class ForceTorqueFootOdometer:
-    def __init__(self, robot_id, pb_kin, foot_link_names, visualization=False, alpha=0.1, contact_threshold=10.0):
+    def __init__(self, robot_id, pb_kin, foot_link_names, visualization=False, alpha=0.99, contact_threshold=50.0):
         self.robot_id = robot_id
         self.pb_kin = pb_kin
         self.foot_contact_ids = [self.pb_kin.link_names.index(name) for name in foot_link_names]

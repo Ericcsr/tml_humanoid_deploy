@@ -98,7 +98,7 @@ while True:
             root_a = root_a,
             tau = tau
         )
-    root_pos = root_pos_low_pass.filter(root_pos)
+    #root_pos = root_pos_low_pass.filter(root_pos)
     root_data = np.hstack((root_pos, root_orn, root_vel))
     redis_client.set("root_data", pickle.dumps(root_data))
     rate.sleep()

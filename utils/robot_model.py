@@ -94,6 +94,7 @@ class KinematicsModel:
         self.eef_id = [
             self.link_names.index(name) for name in ["left_rubber_hand", "right_rubber_hand"]
         ]
+        pb.setGravity(0.0, 0.0, -9.81)
         self.head_id = self.link_names.index("head_link")
         self.waist_jid = [12, 13, 14]
         self.left_arm_jid = [15, 16, 17, 18, 19, 20, 21]
@@ -130,7 +131,7 @@ class KinematicsModel:
             )
         pb.resetBasePositionAndOrientation(
             self.robot,
-            root_pose[:3] + Rotation.from_quat(root_pose[3:]).apply(np.array([0.0, 0.0, -0.02])),
+            root_pose[:3], #+ Rotation.from_quat(root_pose[3:]).apply(np.array([0.0, 0.0, -0.02])),
             root_pose[3:],
         )
 
