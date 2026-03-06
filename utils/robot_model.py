@@ -10,6 +10,7 @@ from utils.redis_utils import REDIS_IP, REDIS_PORT
 from utils.params import REVOLUTE_JOINTS, ZERO, FOOT_SPHERE_NAMES
 from utils.state_estimation import (
     FootOdometer,
+    ForceTorqueFootOdometer,
     QuaternionCollaborativeFilterSimple,
     RootPoseFilterSimple,
 )
@@ -66,6 +67,7 @@ class KinematicsModel:
         mocap_link_name="mid360_link",
         use_slam=True,
         use_foot_odo=True,
+        use_acc=False,
     ):
         pb.connect(pb.GUI if visualize else pb.DIRECT)
         self.redis_client = redis.Redis(redis_ip, port=redis_port, db=0)
@@ -92,6 +94,7 @@ class KinematicsModel:
         self.eef_id = [
             self.link_names.index(name) for name in ["left_rubber_hand", "right_rubber_hand"]
         ]
+        pb.setGravity(0.0, 0.0, -9.81)
         self.head_id = self.link_names.index("head_link")
         self.waist_jid = [12, 13, 14]
         self.left_arm_jid = [15, 16, 17, 18, 19, 20, 21]
@@ -100,7 +103,11 @@ class KinematicsModel:
         self.root_pose = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
         self.quaternion_filter = QuaternionCollaborativeFilterSimple()
         self.q = np.zeros(29)
-        self.foot_odo = FootOdometer(self.robot, pb_kin=self, foot_link_names=FOOT_SPHERE_NAMES)
+        self.use_acc = use_acc
+        if not use_acc:
+            self.foot_odo = FootOdometer(self.robot, pb_kin=self, foot_link_names=FOOT_SPHERE_NAMES)
+        else:
+            self.foot_odo = ForceTorqueFootOdometer(self.robot, pb_kin=self, foot_link_names=FOOT_SPHERE_NAMES)
         self.pos_filter = RootPoseFilterSimple(alpha=0.8)
         self.t = 0
         self.root_pos = np.zeros(3, dtype=np.float32)
@@ -124,7 +131,7 @@ class KinematicsModel:
             )
         pb.resetBasePositionAndOrientation(
             self.robot,
-            root_pose[:3] + Rotation.from_quat(root_pose[3:]).apply(np.array([0.0, 0.0, -0.02])),
+            root_pose[:3], #+ Rotation.from_quat(root_pose[3:]).apply(np.array([0.0, 0.0, -0.02])),
             root_pose[3:],
         )
 
@@ -137,7 +144,7 @@ class KinematicsModel:
         )
 
     def update_root_state(
-        self, q, imu_quat=None, dq=None, omega=None, head_pos=None, head_quat=None
+        self, q, imu_quat=None, dq=None, omega=None, head_pos=None, head_quat=None, ddq=None, root_a=None, tau=None
     ):
         self.q = q
         if self.use_slam:
@@ -164,7 +171,10 @@ class KinematicsModel:
             #self.root_quat = self.quaternion_filter.update(imu_quat, self.root_quat)
             self.root_quat = imu_quat # directly use imu quaternion
         if dq is not None and omega is not None:
-            root_vel, z = self.foot_odo.estimate_velocity(q, dq, self.root_quat, omega)
+            if not self.use_acc:
+                root_vel, z = self.foot_odo.estimate_velocity(q, dq, self.root_quat, omega)
+            else:
+                root_vel, z = self.foot_odo.estimate_velocity(q, dq, self.root_quat, omega, root_a, ddq, tau)
             if self.use_slam:
                 # root_pos_slam[2] = root_pos_slam[2] / 2 + z / 2
                 # self.root_pos[2] = z

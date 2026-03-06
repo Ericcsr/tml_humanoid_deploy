@@ -185,6 +185,7 @@ def run_simulation(control_lock, data_lock, xml_path, config):
         model.opt.timestep = config.get("simulation_dt", 0.005)
         rate = Rate(1/model.opt.timestep)  # 200 Hz by default
         ts = time.time()
+        ts_acc = time.time()
         while True:
             
             with control_lock:
@@ -242,6 +243,15 @@ def run_simulation(control_lock, data_lock, xml_path, config):
                 redis_client.set("head_pos", pickle.dumps(data.xpos[model.body("torso_link").id].copy()))
                 redis_client.set("head_quat", pickle.dumps(data.xquat[model.body("torso_link").id][[1,2,3,0]].copy()))
                 ts = now
+            if now - ts_acc > 0.02:
+                root_rot = data.xmat[1].reshape(3, 3) 
+                linear_accel_local = root_rot.T @ (data.qacc[0:3] - np.array([0.0, 0.0, 9.81]))
+                angular_accel_local = root_rot.T @ data.qacc[3:6]
+                root_a = np.hstack([linear_accel_local, angular_accel_local])
+                redis_client.set("ddq", pickle.dumps(data.qacc[6:35]))
+                redis_client.set("root_a", pickle.dumps(root_a))
+                redis_client.set("tau", pickle.dumps(data.ctrl[:]))
+                ts_acc = now
             viewer.sync()                                                                  
             rate.sleep()
             #print("Sim step fps:", 1/(time.time() - ts))

@@ -288,7 +288,7 @@ class FootOdometer:
         omega = Rotation.from_quat(quat).apply(omega)  # convert to world frame
         pose = np.zeros(7, dtype=np.float32)
         pose[3:] = quat.copy()
-        self.pb_kin.set_robot_state(q, pose, dq, omega * 0.0)
+        self.pb_kin.set_robot_state(q, pose, dq, omega*0.0)
         # Get foot positions
 
         link_states = pb.getLinkStates(
@@ -310,6 +310,95 @@ class FootOdometer:
         self.clip_velocity()
         return self.last_velocity.copy(), z  # assume flat ground
 
+class ForceTorqueFootOdometer:
+    def __init__(self, robot_id, pb_kin, foot_link_names, visualization=False, alpha=0.99, contact_threshold=50.0):
+        self.robot_id = robot_id
+        self.pb_kin = pb_kin
+        self.foot_contact_ids = [self.pb_kin.link_names.index(name) for name in foot_link_names]
+        
+        # Fusion State
+        self.fused_vel = np.zeros(3)
+        self.alpha = alpha  # Fusion gain: higher = trust kinematics more, lower = trust IMU more
+        self.contact_threshold = contact_threshold
+        
+        # Visualization setup
+        self.visualization = visualization
+        self.force_scale = 0.005
+        self.debug_line_ids = {foot_id: None for foot_id in self.foot_contact_ids}
+
+    def estimate_velocity(self, q, dq, quat, omega, root_a, ddq, tau, dt=0.002):
+        """
+        Fuses IMU acceleration integration with proprioceptive foot kinematics.
+        """
+        # 1. Coordinate Transformations
+        rot = Rotation.from_quat(quat)
+        omega_world = rot.apply(omega)
+        
+        # Get kinematic acceleration (remove gravity if root_a is raw IMU proper acceleration)
+        # We assume root_a is in the local frame
+        root_lin_a_world = rot.apply(root_a[:3])
+        root_lin_a_world[2] -= 9.81  # Subtract gravity to get motion acceleration
+        
+        root_ang_a_world = rot.apply(root_a[3:])
+        root_a_world = np.concatenate((root_lin_a_world + [0, 0, 9.81], root_ang_a_world))
+
+        # 2. Kinematic Velocity (v_kin) Calculation
+        pose = np.zeros(7, dtype=np.float32)
+        pose[3:] = quat.copy()
+        self.pb_kin.set_robot_state(q, pose, dq, omega_world * 0.0)
+        
+        link_states = pb.getLinkStates(self.robot_id, self.foot_contact_ids, computeLinkVelocity=True)
+
+        # Inverse Dynamics to find contact
+        pos_full = [0, 0, 0] + list(quat) + q.tolist()
+        vel_full = [0, 0, 0] + list(omega_world) + dq.tolist() 
+        acc_full = list(root_a_world) + ddq.tolist()
+
+        tau_id_full = pb.calculateInverseDynamics(self.robot_id, pos_full, vel_full, acc_full)
+        tau_id = np.array(tau_id_full[-len(q):]) 
+        tau_ext = tau_id - np.array(tau)
+
+        best_foot_idx = 0
+        max_fz = -np.inf
+
+        for idx, foot_id in enumerate(self.foot_contact_ids):
+            J_lin, _ = pb.calculateJacobian(self.robot_id, foot_id, [0, 0, 0], q.tolist(), dq.tolist(), ddq.tolist())
+            J_joints = np.array(J_lin)[:, -len(q):]
+            f_ext = np.linalg.pinv(J_joints.T) @ tau_ext
+
+            if self.visualization:
+                self._update_debug_lines(foot_id, link_states[idx][0], f_ext)
+
+            if f_ext[2] > max_fz:
+                max_fz = f_ext[2]
+                best_foot_idx = idx
+
+        # Instantaneous kinematic velocity from the "stablest" foot
+        c_pos, _, _, _, _, _, c_vel, _ = link_states[best_foot_idx]
+        v_kin = -np.array(c_vel) - np.cross(omega_world, np.array(c_pos))
+
+        # 3. Sensor Fusion (Complementary Filter)
+        
+        # A. Prediction Step (Integration)
+        v_pred = self.fused_vel + root_lin_a_world * dt
+        
+        # B. Correction Step
+        # If the robot is likely in the air, we reduce alpha to ignore foot noise
+        effective_alpha = self.alpha if max_fz > self.contact_threshold else 0.001
+        
+        self.fused_vel = (1 - effective_alpha) * v_pred + effective_alpha * v_kin
+
+        return self.fused_vel.copy(), -np.array(c_pos)[2]
+
+    def _update_debug_lines(self, foot_id, pos, force):
+        end_pos = [pos[0] + force[0]*self.force_scale, 
+                   pos[1] + force[1]*self.force_scale, 
+                   pos[2] + force[2]*self.force_scale]
+        color = [1, 0, 0] if force[2] > self.contact_threshold else [0.5, 0.5, 0.5]
+        if self.debug_line_ids[foot_id] is None:
+            self.debug_line_ids[foot_id] = pb.addUserDebugLine(pos, end_pos, color, 3)
+        else:
+            self.debug_line_ids[foot_id] = pb.addUserDebugLine(pos, end_pos, color, 3, replaceItemUniqueId=self.debug_line_ids[foot_id])
 
 def _q_norm(q):
     q = np.asarray(q, dtype=np.float64)
