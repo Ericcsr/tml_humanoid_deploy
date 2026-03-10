@@ -72,7 +72,9 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
     env.set_robot_state(policy.get_q_init())
     env.maintain_state(policy.get_q_init())
 
-    rate = Rate(1/config.get("control_dt", 0.02))  # 50 Hz
+    control_dt = config.get("control_dt", 0.02)
+    slow_down = config.get("slow_down", 1.0)
+    rate = Rate(1 / (control_dt * slow_down))
 
     robot_state = G1RobotState()
 
@@ -191,9 +193,9 @@ if __name__ == "__main__":
     parser.add_argument("--use_sim", action="store_true", help="Use simulation environment instead of real robot.")
     parser.add_argument("--use_odom", action="store_true", help="Use odometry for state estimation.")
     parser.add_argument("--vr", action="store_true", default=False, help="Use 3-point VR controller.")
-    parser.add_argument("--chip", action="store_true", default=False, help="Use local chip model.")
     parser.add_argument("--net", type=str, required=False, help="Network interface for the robot controller.")
     parser.add_argument("--metric", action="store_true", help="Compute mean joint/root errors vs reference during rollout, then exit.")
+    parser.add_argument("--slow_down", type=float, default=1.0, help="Slow down simulation and policy by x times (does not affect simulation_dt).")
     args = parser.parse_args()
 
     import yaml
@@ -204,9 +206,13 @@ if __name__ == "__main__":
     # override config with command line args
     config["use_sim"] = args.use_sim
     config["use_odom"] = args.use_odom
+    config["slow_down"] = args.slow_down
 
     if args.metric and not config.get("use_root_state", False):
         raise ValueError("--metric requires use_root_state: True in config (for root position/orientation).")
+
+    if args.slow_down != 1.0:
+        print(f"[run_controller] Slow down: {args.slow_down}x (simulation_dt unchanged)", flush=True)
 
     if args.use_sim:
         from mujoco_env import MujocoRobot
@@ -236,7 +242,7 @@ if __name__ == "__main__":
     if args.vr:
         policy = RL3ptPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
                             lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips)
-    elif args.chip:
+    elif config.get("use_chip", False):
         policy = RLCHIPPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
                             lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
                             hist_names=config.get("history_names", []), hist_length=config.get("history_length", 1))

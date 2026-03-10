@@ -1,3 +1,5 @@
+import os
+import tempfile
 import time
 import mujoco
 import mujoco.viewer
@@ -155,9 +157,13 @@ def zero_torque_control():
     return np.zeros(29, dtype=np.float32)
 
 def run_simulation(control_lock, data_lock, xml_path, config):
-        with open(xml_path, 'r') as f:
-            xml = f.read()
-        model = mujoco.MjModel.from_xml_string(xml)
+        try:
+            with open(xml_path, "r") as f:
+                xml = f.read()
+            model = mujoco.MjModel.from_xml_string(xml)
+        except Exception as e:
+            print(f"[run_simulation] Failed to load MuJoCo model: {e}", flush=True)
+            raise
         data = mujoco.MjData(model)
 
         redis_client = redis.Redis(host=REDIS_IP, port=REDIS_PORT, db=0)
@@ -183,7 +189,8 @@ def run_simulation(control_lock, data_lock, xml_path, config):
         torque_limit = np.array(config['torque_limit'], dtype=np.float32)
 
         model.opt.timestep = config.get("simulation_dt", 0.005)
-        rate = Rate(1/model.opt.timestep)  # 200 Hz by default
+        slow_down = config.get("slow_down", 1.0)
+        rate = Rate(1 / (model.opt.timestep * slow_down))
         ts = time.time()
         ts_acc = time.time()
         while True:
@@ -263,7 +270,58 @@ class MujocoRobot:
             config
         ):
         self.xml_path = xml_path
-        
+        self._terrain_temp_file = None
+        xml_path_to_load = xml_path
+
+        # Merge terrain from URDF only when explicitly configured (skip if absent or empty)
+        terrain_urdf = config.get("terrain_urdf") or ""
+        terrain_urdf = str(terrain_urdf).strip() if terrain_urdf else ""
+        if "terrain_urdf" in config and terrain_urdf:
+            from utils.urdf_to_mujoco import merge_terrain_into_scene
+            terrain_path = os.path.abspath(terrain_urdf) if os.path.isabs(terrain_urdf) else os.path.normpath(os.path.join(os.getcwd(), terrain_urdf))
+            if not os.path.exists(terrain_path):
+                raise FileNotFoundError(
+                    f"terrain_urdf not found: {terrain_path}\n"
+                    f"  (resolved from config terrain_urdf: {terrain_urdf})"
+                )
+            merged_xml = merge_terrain_into_scene(
+                xml_path,
+                terrain_path,
+                use_columns_for_collision=config.get("terrain_use_columns", True),
+                terrain_column_res=config.get("terrain_column_res", 0.2),
+                terrain_floor_threshold=config.get("terrain_floor_threshold", 0.02),
+            )
+            fd, self._terrain_temp_file = tempfile.mkstemp(suffix=".xml", prefix="mujoco_scene_", dir=os.getcwd())
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(merged_xml)
+                xml_path_to_load = self._terrain_temp_file
+            except Exception:
+                os.close(fd)
+                if self._terrain_temp_file and os.path.exists(self._terrain_temp_file):
+                    os.unlink(self._terrain_temp_file)
+                raise
+
+        # Validate model loads before starting subprocess (errors there are silenced)
+        try:
+            with open(xml_path_to_load, "r") as f:
+                xml_content = f.read()
+            mujoco.MjModel.from_xml_string(xml_content)
+        except Exception as e:
+            msg = (
+                f"Failed to load MuJoCo model from {xml_path_to_load}\n"
+                f"  Error: {e}\n"
+            )
+            if terrain_urdf:
+                msg += (
+                    f"  Terrain was merged from: {terrain_path}\n"
+                    f"  Check that the URDF and mesh file exist and are valid."
+                )
+            raise RuntimeError(msg) from e
+
+        if terrain_urdf:
+            print(f"[MujocoRobot] Terrain loaded from {terrain_path}", flush=True)
+
         self.control_var = shared_np(30, "control", np.float32)
         self.q_var = shared_np(29, "q", np.float32)
         self.dq_var = shared_np(29, "dq", np.float32)
@@ -278,7 +336,7 @@ class MujocoRobot:
         self.data_lock = mp.Lock()
         self.config = config
         self.control_dt = config.get("control_dt", 0.02) # default 50 Hz
-        self.process = mp.Process(target=run_simulation, args=(self.control_lock, self.data_lock, self.xml_path, self.config))
+        self.process = mp.Process(target=run_simulation, args=(self.control_lock, self.data_lock, xml_path_to_load, self.config))
         self.process.start()
 
     def pd_control(self, target_q):
@@ -343,6 +401,11 @@ class MujocoRobot:
     def close(self):
         self.process.terminate()
         self.process.join()
+        if self._terrain_temp_file and os.path.exists(self._terrain_temp_file):
+            try:
+                os.unlink(self._terrain_temp_file)
+            except OSError:
+                pass
 
     def get_start_ticker(self):
         return True
