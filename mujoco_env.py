@@ -78,16 +78,29 @@ shm_buffer = []
 class ElasticBand:
     """
     ref: https://github.com/unitreerobotics/unitree_mujoco
+    Tethers robot to a point and orientation. When init_pos/init_quat are provided
+    (e.g. from first frame with terrain), uses those as target instead of world origin.
     """
 
-    def __init__(self):
+    def __init__(self, init_pos=None, init_quat_xyzw=None):
         self.kp_pos = 10000
         self.kd_pos = 1000
         self.kp_ang = 1000
         self.kd_ang = 10
-        self.point = np.array([0, 0, 1])
+        # Tether point: above init position (or origin when not specified)
+        if init_pos is not None:
+            init_pos[2] = 0
+            self.point = np.array(init_pos, dtype=np.float64) + np.array([0, 0, 1])
+        else:
+            self.point = np.array([0, 0, 1])
         self.length = 0
         self.enable = True
+        # Target orientation for PD (None = identity / forward-facing)
+        self.target_rot = (
+            scipy.spatial.transform.Rotation.from_quat(init_quat_xyzw)
+            if init_quat_xyzw is not None
+            else None
+        )
 
     def Advance(self, pose):
         """
@@ -108,10 +121,15 @@ class ElasticBand:
         δx = self.point - pos
         f = self.kp_pos * (δx + np.array([0, 0, self.length])) + self.kd_pos * (0 - lin_vel)
 
-        # --- Orientation PD control for torque ---
-        quat = np.array([quat[1], quat[2], quat[3], quat[0]])  # reorder to [x,y,z,w] for scipy
-        rot = scipy.spatial.transform.Rotation.from_quat(quat)
-        rotvec = rot.as_rotvec()  # axis-angle error
+        # --- Orientation PD: error from current to target ---
+        quat_xyzw = np.array([quat[1], quat[2], quat[3], quat[0]])
+        rot = scipy.spatial.transform.Rotation.from_quat(quat_xyzw)
+        if self.target_rot is not None:
+            # Error: rotation from target to current (we want to reduce this)
+            err_rot = rot * self.target_rot.inv()
+            rotvec = err_rot.as_rotvec()
+        else:
+            rotvec = rot.as_rotvec()  # target = identity
         torque = -self.kp_ang * rotvec - self.kd_ang * ang_vel
 
         return np.concatenate([f, torque])
@@ -156,7 +174,8 @@ def damping_control(data, kd):
 def zero_torque_control():
     return np.zeros(29, dtype=np.float32)
 
-def run_simulation(control_lock, data_lock, xml_path, config):
+
+def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None):
         try:
             with open(xml_path, "r") as f:
                 xml = f.read()
@@ -166,9 +185,64 @@ def run_simulation(control_lock, data_lock, xml_path, config):
             raise
         data = mujoco.MjData(model)
 
+        # When terrain + sim: init robot at first frame xy, heading, and joints
+        sim_init_pos = config.get("sim_init_root_pos")
+        sim_init_orn = config.get("sim_init_root_orn")
+        sim_init_joints = config.get("sim_init_joint_pos")
+        if sim_init_pos is not None and sim_init_orn is not None:
+            data.qpos[:3] = np.array(sim_init_pos, dtype=np.float64)
+            # MuJoCo quat: wxyz; ref uses xyzw
+            q_xyzw = np.array(sim_init_orn, dtype=np.float64)
+            data.qpos[3:7] = np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
+            if sim_init_joints is not None:
+                data.qpos[7:36] = np.array(sim_init_joints, dtype=np.float64)
+            mujoco.mj_forward(model, data)
+
+        # Object: init at first frame, kinematic control until wrist contact (then physics takes over)
+        object_trans = None
+        object_quat_wxyz = None
+        object_qposadr = None
+        object_dofadr = None
+        object_body_id = None
+        object_kinematic_released = False
+        wrist_contacted = set()  # body ids of wrists that have contacted object
+        left_wrist_body_id = None
+        right_wrist_body_id = None
+        object_motion = config.get("object_motion")
+        if object_motion:
+            object_motion = os.path.abspath(object_motion) if os.path.isabs(object_motion) else os.path.normpath(os.path.join(os.getcwd(), object_motion))
+            try:
+                object_body_id = model.body("floating_object").id
+                jnt_id = model.body_jntadr[object_body_id]
+                object_qposadr = int(model.jnt_qposadr[jnt_id])
+                object_dofadr = int(model.jnt_dofadr[jnt_id])
+                left_wrist_body_id = model.body("left_wrist_yaw_link").id
+                right_wrist_body_id = model.body("right_wrist_yaw_link").id
+                obj_motion_data = np.load(object_motion)
+                object_trans = obj_motion_data["object_trans"]
+                object_quat_wxyz = obj_motion_data["object_quat_wxyz"]
+                # Initialize object at first frame pose
+                data.qpos[object_qposadr:object_qposadr + 3] = object_trans[0]
+                data.qpos[object_qposadr + 3:object_qposadr + 7] = object_quat_wxyz[0]
+                data.qvel[object_dofadr:object_dofadr + 6] = 0.0
+                mujoco.mj_forward(model, data)
+                print(f"[run_simulation] Object loaded: {object_trans.shape[0]} frames (kinematic until both wrists contact)", flush=True)
+            except Exception as e:
+                print(f"[run_simulation] Object init failed: {e}", flush=True)
+                object_trans = None
+                object_quat_wxyz = None
+                object_qposadr = None
+                object_dofadr = None
+                object_body_id = None
+                left_wrist_body_id = None
+                right_wrist_body_id = None
+
         redis_client = redis.Redis(host=REDIS_IP, port=REDIS_PORT, db=0)
 
-        elastic_band = ElasticBand()
+        # Elastic band: use first-frame pos/orn when init at first frame (terrain)
+        band_init_pos = sim_init_pos if sim_init_pos is not None else None
+        band_init_quat = sim_init_orn if sim_init_orn is not None else None
+        elastic_band = ElasticBand(init_pos=band_init_pos, init_quat_xyzw=band_init_quat)
         band_attached_link = model.body("torso_link").id
 
         viewer = mujoco.viewer.launch_passive(model, data, key_callback=elastic_band.MujuocoKeyCallback)
@@ -234,7 +308,34 @@ def run_simulation(control_lock, data_lock, xml_path, config):
                 data.xfrc_applied[band_attached_link] = elastic_band.Advance(pose)
             else:
                 data.xfrc_applied[band_attached_link] = np.zeros(6)
+
             mujoco.mj_step(model, data)
+
+            # Object: require both wrists to contact before releasing kinematic control (let physics act)
+            if object_body_id is not None and left_wrist_body_id is not None and right_wrist_body_id is not None and not object_kinematic_released:
+                for i in range(data.ncon):
+                    b1 = model.geom_bodyid[data.contact[i].geom1]
+                    b2 = model.geom_bodyid[data.contact[i].geom2]
+                    if b1 == object_body_id or b2 == object_body_id:
+                        other = b2 if b1 == object_body_id else b1
+                        if other == left_wrist_body_id:
+                            wrist_contacted.add(left_wrist_body_id)
+                        elif other == right_wrist_body_id:
+                            wrist_contacted.add(right_wrist_body_id)
+                if left_wrist_body_id in wrist_contacted and right_wrist_body_id in wrist_contacted:
+                    object_kinematic_released = True
+                    print("[run_simulation] Both wrists contacted object, releasing kinematic control", flush=True)
+
+            # Object trajectory: kinematic control until wrist contact; then physics takes over
+            if (object_trans is not None and object_qposadr is not None and ticker_value is not None
+                    and not object_kinematic_released):
+                ticker = ticker_value.value
+                if ticker >= 0:
+                    frame_idx = min(int(ticker), len(object_trans) - 1)
+                    data.qpos[object_qposadr:object_qposadr + 3] = object_trans[frame_idx]
+                    data.qpos[object_qposadr + 3:object_qposadr + 7] = object_quat_wxyz[frame_idx]
+                    data.qvel[object_dofadr:object_dofadr + 6] = 0.0
+                    mujoco.mj_forward(model, data)
             with data_lock:
                 q[:] = data.qpos[7:36].copy()
                 dq[:] = data.qvel[6:35].copy()
@@ -265,9 +366,10 @@ def run_simulation(control_lock, data_lock, xml_path, config):
 
 class MujocoRobot:
     def __init__(
-            self, 
-            xml_path, 
-            config
+            self,
+            xml_path,
+            config,
+            ticker_value=None,
         ):
         self.xml_path = xml_path
         self._terrain_temp_file = None
@@ -322,6 +424,32 @@ class MujocoRobot:
         if terrain_urdf:
             print(f"[MujocoRobot] Terrain loaded from {terrain_path}", flush=True)
 
+        # Merge object from URDF when configured (object added LAST to preserve robot indices)
+        object_urdf = config.get("object_urdf") or ""
+        object_urdf = str(object_urdf).strip() if object_urdf else ""
+        if "object_urdf" in config and object_urdf:
+            from utils.urdf_to_mujoco import merge_object_into_scene
+            object_path = os.path.abspath(object_urdf) if os.path.isabs(object_urdf) else os.path.normpath(os.path.join(os.getcwd(), object_urdf))
+            if not os.path.exists(object_path):
+                raise FileNotFoundError(f"object_urdf not found: {object_path}")
+            with open(xml_path_to_load, "r") as f:
+                scene_xml = f.read()
+            merged_xml = merge_object_into_scene(scene_xml, object_path)
+            fd_obj, obj_temp = tempfile.mkstemp(suffix=".xml", prefix="mujoco_scene_obj_", dir=os.getcwd())
+            try:
+                with os.fdopen(fd_obj, "w") as f:
+                    f.write(merged_xml)
+                xml_path_to_load = obj_temp
+                if self._terrain_temp_file:
+                    os.unlink(self._terrain_temp_file)
+                self._terrain_temp_file = obj_temp
+            except Exception:
+                os.close(fd_obj)
+                if os.path.exists(obj_temp):
+                    os.unlink(obj_temp)
+                raise
+            print(f"[MujocoRobot] Object loaded from {object_path}", flush=True)
+
         self.control_var = shared_np(30, "control", np.float32)
         self.q_var = shared_np(29, "q", np.float32)
         self.dq_var = shared_np(29, "dq", np.float32)
@@ -336,7 +464,7 @@ class MujocoRobot:
         self.data_lock = mp.Lock()
         self.config = config
         self.control_dt = config.get("control_dt", 0.02) # default 50 Hz
-        self.process = mp.Process(target=run_simulation, args=(self.control_lock, self.data_lock, xml_path_to_load, self.config))
+        self.process = mp.Process(target=run_simulation, args=(self.control_lock, self.data_lock, xml_path_to_load, self.config, ticker_value))
         self.process.start()
 
     def pd_control(self, target_q):

@@ -6,7 +6,7 @@ import pickle
 from multiprocessing import Value
 from utils.redis_utils import REDIS_IP, REDIS_PORT
 from scipy.spatial.transform import Rotation
-from rl_policy import RLBMPolicy, RL3ptPolicy, RLCHIPPolicy
+from rl_policy import RLBMPolicy, RL3ptPolicy, RLCHIPPolicy, RLContactPolicy
 
 from utils.params import DEFAULT_POSE, ACTION_SCALE, ISAAC_TO_MUJOCO
 from utils.robot_utils import Rate
@@ -214,13 +214,32 @@ if __name__ == "__main__":
     if args.slow_down != 1.0:
         print(f"[run_controller] Slow down: {args.slow_down}x (simulation_dt unchanged)", flush=True)
 
+    # When terrain/object + sim: init robot at first frame xy and heading (for placement)
+    terrain_urdf = config.get("terrain_urdf") or ""
+    terrain_urdf = str(terrain_urdf).strip() if terrain_urdf else ""
+    object_urdf = config.get("object_urdf") or ""
+    object_urdf = str(object_urdf).strip() if object_urdf else ""
+    object_motion = config.get("object_motion") or ""
+    object_motion = str(object_motion).strip() if object_motion else ""
+    has_object = bool(("object_urdf" in config and object_urdf) or ("object_motion" in config and object_motion))
+    init_at_first_frame = bool(
+        ("terrain_urdf" in config and terrain_urdf and args.use_sim) or
+        (has_object and args.use_sim)
+    )
+    if init_at_first_frame:
+        from utils.params import ISAAC_TO_MUJOCO
+        ref_motion = np.load(config["ref_motion_path"])
+        config["sim_init_root_pos"] = ref_motion["body_pos_w"][0, 0].copy()
+        config["sim_init_root_orn"] = ref_motion["body_quat_w"][0, 0][[1, 2, 3, 0]].copy()
+        config["sim_init_joint_pos"] = ref_motion["joint_pos"][0, ISAAC_TO_MUJOCO].copy()
+        print(f"[run_controller] Init at first frame: xy=({config['sim_init_root_pos'][0]:.2f}, {config['sim_init_root_pos'][1]:.2f}) z={config['sim_init_root_pos'][2]:.2f}", flush=True)
+
     if args.use_sim:
         from mujoco_env import MujocoRobot
         from ref_motion_visualizer import start_ref_visualizer_process
 
-        env = MujocoRobot(config["mujoco_xml_path"], config)
-
         ticker_value = Value("f", 0.0)
+        env = MujocoRobot(config["mujoco_xml_path"], config, ticker_value=ticker_value)
         # Only start ref motion visualizer when --metric is enabled
         if args.metric:
             ref_vis_process = start_ref_visualizer_process(
@@ -241,14 +260,22 @@ if __name__ == "__main__":
     lookahead_frame_skips = config.get("lookahead_frame_skips",1)
     if args.vr:
         policy = RL3ptPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
-                            lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips)
+                            lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
+                            init_at_first_frame=init_at_first_frame)
     elif config.get("use_chip", False):
         policy = RLCHIPPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
                             lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
-                            hist_names=config.get("history_names", []), hist_length=config.get("history_length", 1))
+                            hist_names=config.get("history_names", []), hist_length=config.get("history_length", 1),
+                            init_at_first_frame=init_at_first_frame)
+    elif config.get("use_contact", False):
+        policy = RLContactPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], config["contact_labels_path"], 
+                            lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
+                            hist_names=config.get("history_names", []), hist_length=config.get("history_length", 1),
+                            init_at_first_frame=init_at_first_frame)
     else:
         policy = RLBMPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
-                            lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips)
+                            lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
+                            init_at_first_frame=init_at_first_frame)
 
     try:
         result = main(env, policy, config, ticker_value=ticker_value, compute_metrics_flag=args.metric)

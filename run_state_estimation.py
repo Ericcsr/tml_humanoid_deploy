@@ -15,6 +15,8 @@ parser.add_argument("--use_slam", action="store_true", default=False,
 parser.add_argument("--use_acc", action="store_true", default=False)
 parser.add_argument("--visualize", action="store_true", default=False,
                     help="Whether to visualize the kinematics model")
+parser.add_argument("--slow_down", type=float, default=1.0,
+                    help="Slow down state estimation loop by x times.")
 args = parser.parse_args()
 
 
@@ -67,7 +69,10 @@ kin_model = KinematicsModel(mocap_link_name="torso_link" if args.use_sim else "m
                             use_slam=args.use_slam, visualize=args.visualize, use_acc=args.use_acc)
 redis_client = kin_model.redis_client
 
-rate = Rate(50)  # 50 Hz
+base_hz = 50
+rate = Rate(base_hz / args.slow_down)
+if args.slow_down != 1.0:
+    print(f"[run_state_estimation] Slow down: {args.slow_down}x", flush=True)
 
 redis_client.delete("proprio_data")
 root_pos_low_pass = LowPassFilter(alpha=0.5)

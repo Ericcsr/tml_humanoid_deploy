@@ -10,3 +10,36 @@ ERROR: could not create window
 Thu Oct 23 22:38:07 2025
 ERROR: could not create window
 
+Tue Mar 10 10:58:42 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 0. The simulation is unstable. Time = 0.1750.
+
+Tue Mar 10 11:04:09 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 0. The simulation is unstable. Time = 0.2350.
+
+Tue Mar 10 13:55:10 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 38. The simulation is unstable. Time = 0.0550.
+
+Tue Mar 10 13:57:28 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 38. The simulation is unstable. Time = 0.0550.
+
+Tue Mar 10 15:08:59 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 38. The simulation is unstable. Time = 0.0600.
+
+Tue Mar 10 15:10:06 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 38. The simulation is unstable. Time = 0.0600.
+
+Tue Mar 10 15:32:23 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 35. The simulation is unstable. Time = 0.0350.
+
+Tue Mar 10 15:33:24 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 35. The simulation is unstable. Time = 0.0350.
+
+Tue Mar 10 15:36:48 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 35. The simulation is unstable. Time = 0.0350.
+
+Tue Mar 10 16:23:27 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 35. The simulation is unstable. Time = 0.0350.
+
+Tue Mar 10 16:30:00 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 38. The simulation is unstable. Time = 11.3250.
+
