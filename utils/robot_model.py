@@ -68,6 +68,7 @@ class KinematicsModel:
         use_slam=True,
         use_foot_odo=True,
         use_acc=False,
+        use_sim=False,
     ):
         pb.connect(pb.GUI if visualize else pb.DIRECT)
         self.redis_client = redis.Redis(redis_ip, port=redis_port, db=0)
@@ -101,7 +102,7 @@ class KinematicsModel:
         self.right_arm_jid = [22, 23, 24, 25, 26, 27, 28]
         self.mocap_link_id = self.link_names.index(mocap_link_name)
         self.root_pose = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
-        self.quaternion_filter = QuaternionCollaborativeFilterSimple()
+        self.quaternion_filter = QuaternionCollaborativeFilterSimple(use_sim=use_sim)
         self.q = np.zeros(29)
         self.use_acc = use_acc
         if not use_acc:

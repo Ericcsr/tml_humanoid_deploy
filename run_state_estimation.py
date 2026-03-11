@@ -66,7 +66,8 @@ class LowPassFilter:
         return self.state
 
 kin_model = KinematicsModel(mocap_link_name="torso_link" if args.use_sim else "mid360_link", 
-                            use_slam=args.use_slam, visualize=args.visualize, use_acc=args.use_acc)
+                            use_slam=args.use_slam, visualize=args.visualize, use_acc=args.use_acc,
+                            use_sim=args.use_sim)
 redis_client = kin_model.redis_client
 
 base_hz = 50

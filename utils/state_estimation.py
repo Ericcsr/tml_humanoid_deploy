@@ -535,12 +535,14 @@ class QuaternionCollaborativeFilterSimple:
     World origin:
       - Z axis = inverse gravity (up), i.e., roll/pitch = 0
       - Heading (yaw) = yaw extracted from the FIRST IMU reading
+      - When use_sim=True: use world frame (identity origin) so output matches simulation.
     """
 
-    def __init__(self, tau_yaw=8.0, tau_slam_yaw=1.0, default_dt=0.01):
+    def __init__(self, tau_yaw=8.0, tau_slam_yaw=1.0, default_dt=0.01, use_sim=False):
         self.tau_yaw = float(tau_yaw)
         self.tau_slam_yaw = float(tau_slam_yaw)
         self.default_dt = float(default_dt)
+        self.use_sim = use_sim
 
         self._initialized = False
         self._q_origin = None  # world->IMU0 yaw-only
@@ -552,7 +554,7 @@ class QuaternionCollaborativeFilterSimple:
         self.current_q = None
 
     def reset(self):
-        self.__init__(self.tau_yaw, self.tau_slam_yaw, self.default_dt)
+        self.__init__(self.tau_yaw, self.tau_slam_yaw, self.default_dt, self.use_sim)
 
     def _maybe_init(self, q_imu, q_slam):
         q_imu = _q_norm(q_imu)
@@ -560,9 +562,12 @@ class QuaternionCollaborativeFilterSimple:
         if self._initialized:
             return
 
-        # 1) Origin with Z-up, heading from IMU0
-        psi0 = _yaw_from_q(q_imu)
-        self._q_origin = _q_from_yaw(psi0)  # world->IMU0 (yaw-only)
+        # 1) Origin with Z-up. In sim: use world frame (identity). In real: heading from IMU0.
+        if self.use_sim:
+            self._q_origin = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)  # identity
+        else:
+            psi0 = _yaw_from_q(q_imu)
+            self._q_origin = _q_from_yaw(psi0)  # world->IMU0 (yaw-only)
 
         # 2) Save first poses
         self._q_imu0 = q_imu.copy()

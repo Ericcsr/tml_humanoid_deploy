@@ -386,7 +386,7 @@ class RLCHIPPolicy(RLBasePolicy):
         return np.concatenate(obs).reshape(1,-1)
     
     def get_action(self, obs, start_ticker=False):
-        assert obs.shape == self.input_shape
+        assert obs.shape == self.input_shape, f"Obs shape: {obs.shape}, input shape: {self.input_shape}"
         ort_inputs = {"obs": obs.astype(np.float32)}
                       #"time_step": np.array([[0.0]], dtype=np.float32)}
         ort_outs = self.session.run(None, ort_inputs)
