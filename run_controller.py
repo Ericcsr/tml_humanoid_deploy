@@ -6,7 +6,7 @@ import pickle
 from multiprocessing import Value
 from utils.redis_utils import REDIS_IP, REDIS_PORT
 from scipy.spatial.transform import Rotation
-from rl_policy import RLBMPolicy, RL3ptPolicy, RLCHIPPolicy, RLContactPolicy
+from rl_policy import RLBMPolicy, RL3ptPolicy, RLCHIPPolicy, RLContactPolicy, RLGlobalCHIPPolicy
 
 from utils.params import DEFAULT_POSE, ACTION_SCALE, ISAAC_TO_MUJOCO
 from utils.robot_utils import Rate
@@ -263,10 +263,16 @@ if __name__ == "__main__":
                             lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
                             init_at_first_frame=init_at_first_frame)
     elif config.get("use_chip", False):
-        policy = RLCHIPPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
+        if config.get("only_3pt", False):
+            policy = RLGlobalCHIPPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
                             lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
                             hist_names=config.get("history_names", []), hist_length=config.get("history_length", 1),
                             init_at_first_frame=init_at_first_frame)
+        else:
+            policy = RLCHIPPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
+                                lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
+                                hist_names=config.get("history_names", []), hist_length=config.get("history_length", 1),
+                                init_at_first_frame=init_at_first_frame)                    
     elif config.get("use_contact", False):
         policy = RLContactPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], config["contact_labels_path"], 
                             lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,

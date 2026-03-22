@@ -128,3 +128,16 @@ def yaw_quat(quat: np.ndarray) -> np.ndarray:
 
     quat_yaw_out = normalize(quat_yaw_out)
     return quat_yaw_out.reshape(shape)
+
+
+def yaw_quat_xyzw(quat: np.ndarray) -> np.ndarray:
+    """
+    Extract the yaw component of a quaternion (x, y, z, w).
+    
+    Args:
+        quat: The orientation in (x, y, z, w). Shape is (..., 4)
+    
+    Returns:
+        A quaternion with only yaw component. Same shape as input.
+    """
+    return yaw_quat(quat[..., [3, 0, 1, 2]])[..., [1, 2, 3, 0]]

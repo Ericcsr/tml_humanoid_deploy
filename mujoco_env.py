@@ -175,6 +175,26 @@ def zero_torque_control():
     return np.zeros(29, dtype=np.float32)
 
 
+# Matches rl_policy ref_vr_3point_offsets for left/right wrist (local frame → world); torso row unused here.
+_DEFAULT_VR_3POINT_HAND_OFFSETS = np.array(
+    [[0.18, -0.025, 0.0], [0.18, 0.025, 0.0]], dtype=np.float64
+)
+
+
+def _body_anchor_world_pos(data, body_id, offset_local):
+    """Body origin plus offset expressed in body frame (same convention as vr_3point in rl_policy)."""
+    q_wxyz = data.xquat[body_id]
+    q_xyzw = np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]], dtype=np.float64)
+    return data.xpos[body_id] + Rotation.from_quat(q_xyzw).apply(offset_local)
+
+
+def _object_hand_center_world_pos(data, left_wrist_body_id, right_wrist_body_id, hand_offsets):
+    """Midpoint between left/right hand anchor positions (wrist + 3pt offset in each wrist frame)."""
+    left_p = _body_anchor_world_pos(data, left_wrist_body_id, hand_offsets[0])
+    right_p = _body_anchor_world_pos(data, right_wrist_body_id, hand_offsets[1])
+    return (left_p + right_p) * 0.5
+
+
 def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None):
         try:
             with open(xml_path, "r") as f:
@@ -208,6 +228,15 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None)
         wrist_contacted = set()  # body ids of wrists that have contacted object
         left_wrist_body_id = None
         right_wrist_body_id = None
+        object_position_from_hand_center = bool(config.get("object_position_from_hand_center", False))
+        if object_position_from_hand_center:
+            vho = config.get("vr_3point_hand_offsets")
+            if vho is not None:
+                vr_3point_hand_offsets = np.asarray(vho, dtype=np.float64).reshape(2, 3)
+            else:
+                vr_3point_hand_offsets = _DEFAULT_VR_3POINT_HAND_OFFSETS.copy()
+        else:
+            vr_3point_hand_offsets = None
         object_motion = config.get("object_motion")
         if object_motion:
             object_motion = os.path.abspath(object_motion) if os.path.isabs(object_motion) else os.path.normpath(os.path.join(os.getcwd(), object_motion))
@@ -221,12 +250,26 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None)
                 obj_motion_data = np.load(object_motion)
                 object_trans = obj_motion_data["object_trans"]
                 object_quat_wxyz = obj_motion_data["object_quat_wxyz"]
-                # Initialize object at first frame pose
-                data.qpos[object_qposadr:object_qposadr + 3] = object_trans[0]
+                # Initialize object at first frame pose (position: trajectory or midpoint of wrists)
                 data.qpos[object_qposadr + 3:object_qposadr + 7] = object_quat_wxyz[0]
+                if object_position_from_hand_center:
+                    data.qpos[object_qposadr:object_qposadr + 3] = _object_hand_center_world_pos(
+                        data, left_wrist_body_id, right_wrist_body_id, vr_3point_hand_offsets
+                    )
+                else:
+                    data.qpos[object_qposadr:object_qposadr + 3] = object_trans[0]
                 data.qvel[object_dofadr:object_dofadr + 6] = 0.0
                 mujoco.mj_forward(model, data)
-                print(f"[run_simulation] Object loaded: {object_trans.shape[0]} frames (kinematic until both wrists contact)", flush=True)
+                pos_mode = (
+                    "midpoint of left/right hand anchors (wrist + vr_3point offset) + traj orientation"
+                    if object_position_from_hand_center
+                    else "trajectory pose"
+                )
+                print(
+                    f"[run_simulation] Object loaded: {object_trans.shape[0]} frames, position={pos_mode} "
+                    f"(kinematic until both wrists contact)",
+                    flush=True,
+                )
             except Exception as e:
                 print(f"[run_simulation] Object init failed: {e}", flush=True)
                 object_trans = None
@@ -332,7 +375,12 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None)
                 ticker = ticker_value.value
                 if ticker >= 0:
                     frame_idx = min(int(ticker), len(object_trans) - 1)
-                    data.qpos[object_qposadr:object_qposadr + 3] = object_trans[frame_idx]
+                    if object_position_from_hand_center:
+                        data.qpos[object_qposadr:object_qposadr + 3] = _object_hand_center_world_pos(
+                            data, left_wrist_body_id, right_wrist_body_id, vr_3point_hand_offsets
+                        )
+                    else:
+                        data.qpos[object_qposadr:object_qposadr + 3] = object_trans[frame_idx]
                     data.qpos[object_qposadr + 3:object_qposadr + 7] = object_quat_wxyz[frame_idx]
                     data.qvel[object_dofadr:object_dofadr + 6] = 0.0
                     mujoco.mj_forward(model, data)

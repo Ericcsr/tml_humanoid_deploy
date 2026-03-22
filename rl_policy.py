@@ -4,7 +4,7 @@ import torch
 import time
 import pickle
 from utils.params import MUJOCO_TO_ISAAC, ISAAC_TO_MUJOCO
-from utils.math_utils import yaw_quat
+from utils.math_utils import yaw_quat, yaw_quat_xyzw
 from utils.storage_utils import ObsQueue, HistoryBuffer
 from scipy.spatial.transform import Rotation
 from pynput import keyboard
@@ -29,7 +29,7 @@ class KeyboardController:
                     self.compliance = np.array([0.0, 0.5, 0.0])
             except:
                 pass
-        print("Compliance set to:", self.compliance)
+        #print("Compliance set to:", self.compliance)
     
     def on_press(self, key):
         pass
@@ -277,13 +277,23 @@ class RL3ptPolicy(RLBasePolicy):
     
 
 class RLCHIPPolicy(RLBasePolicy):
+    DEFAULT_Q_POSE = [-0.312, -0.312,  0.   ,  0.   ,  0.   ,  0.   ,  0.   ,  0.   ,
+        0.   ,  0.669,  0.669,  0.2  ,  0.2  , -0.363, -0.363,  0.2  ,
+       -0.2  ,  0.   ,  0.   ,  0.   ,  0.   ,  0.6  ,  0.6  ,  0.   ,
+        0.   ,  0.   ,  0.   ,  0.   ,  0.   ]
+    ACTION_SCALE = [0.548, 0.548, 0.548, 0.351, 0.351, 0.439, 0.548, 0.548, 0.439,
+       0.351, 0.351, 0.439, 0.439, 0.439, 0.439, 0.439, 0.439, 0.439,
+       0.439, 0.439, 0.439, 0.439, 0.439, 0.439, 0.439, 0.075, 0.075,
+       0.075, 0.075]
     def __init__(self, onnx_model_path, obs_names, ref_motion_path, lookahead_steps=1, lookahead_frame_skips=1, hist_names=[], hist_length=10, init_at_first_frame=False):
         super().__init__(onnx_model_path, obs_names)
+        default_joint_pos = self.meta_data["default_joint_pos"].split(",") if "default_joint_pos" in self.meta_data else RLCHIPPolicy.DEFAULT_Q_POSE
+        action_scale = self.meta_data["action_scale"].split(",") if "action_scale" in self.meta_data else RLCHIPPolicy.ACTION_SCALE
         self.default_value = {
-            "q": np.array([float(x) for x in self.meta_data["default_joint_pos"].split(",")]),
+            "q": np.array(default_joint_pos),
             "dq": np.zeros(29)
         }
-        self.action_scale = np.array([float(x) for x in self.meta_data["action_scale"].split(",")])
+        self.action_scale = np.array(action_scale)
         if len(self.action_scale) != 29:
             self.action_scale = np.ones(29) * self.action_scale
         else:
@@ -396,6 +406,45 @@ class RLCHIPPolicy(RLBasePolicy):
             self.ticker = 0
         return ort_outs[0].flatten()
 
+class RLGlobalCHIPPolicy(RLCHIPPolicy):
+    def __init__(self, onnx_model_path, obs_names, ref_motion_path, lookahead_steps=1, lookahead_frame_skips=1, hist_names=[], hist_length=10, init_at_first_frame=False):
+        super().__init__(onnx_model_path, obs_names, ref_motion_path, lookahead_steps, lookahead_frame_skips, hist_names, hist_length, init_at_first_frame)
+
+    def prepare_control_signals(self, robot_state):
+        _ref_joint_pos, _ref_joint_vel, _ref_anchor_pos, _ref_anchor_orn, _ref_vr_3point_poses, _ref_vr_3point_orns = self._control_signals_from_motion()
+        # compute relative to initial frame
+        control_signals = {}
+        if hasattr(self, "obs_queue"):
+            this_cmd = np.hstack([_ref_vr_3point_poses, _ref_vr_3point_orns])
+            self.obs_queue.push(this_cmd)
+            cmd = np.stack(self.obs_queue.get_traj())
+        else:
+            cmd = np.hstack([_ref_vr_3point_poses, _ref_vr_3point_orns])
+
+        # Get current robot 3point positions in global frame
+        heading = yaw_quat_xyzw(robot_state.root_orn)
+        vr_3point_pos_l = (Rotation.from_quat(heading).inv().apply(cmd[:,:,:3].reshape(-1,3) - robot_state.root_pos[None,:])).reshape(-1,3,3)
+        head_orn_l = (Rotation.from_quat(heading).inv() * Rotation.from_quat(cmd[:,2,3:7]))
+        control_signals["vr_3point_pos"] = vr_3point_pos_l.flatten()
+        control_signals["head_ori"] = head_orn_l.as_quat(scalar_first=True).flatten()
+        #print(control_signals["command"])
+        anchor_rot_inv = Rotation.from_quat(robot_state.root_orn).inv()
+        control_signals["projected_gravity"] = anchor_rot_inv.apply(np.array([0,0,-1]))
+        control_signals["compliance"] = self.keyboard_controller.get_compliance()
+        return control_signals
+
+    def get_action(self, obs, start_ticker=False):
+        assert obs.shape == self.input_shape, f"Obs shape: {obs.shape}, input shape: {self.input_shape}"
+        ort_inputs = {"obs_dict": obs.astype(np.float32)}
+                      #"time_step": np.array([[0.0]], dtype=np.float32)}
+        ort_outs = self.session.run(None, ort_inputs)
+        if start_ticker:
+            self.ticker += 1
+        elif self.ticker > 0:
+            self.ticker = 0
+        return ort_outs[0].flatten()
+
+
 class RLContactPolicy(RLBasePolicy):
     def __init__(self, onnx_model_path, obs_names, ref_motion_path, contact_labels_path, lookahead_steps=1, lookahead_frame_skips=1, hist_names=[], hist_length=10, init_at_first_frame=False):
         super().__init__(onnx_model_path, obs_names)
@@ -412,8 +461,11 @@ class RLContactPolicy(RLBasePolicy):
         self.lower_joint_indices = ISAAC_TO_MUJOCO[:12]
         
         self.ref_motion = np.load(ref_motion_path)
-        self.contact_labels = np.load(contact_labels_path, allow_pickle=True).item()
-        self.contact_mask = self.contact_labels["contact_mask"].astype(np.float32)
+        if contact_labels_path != "default":
+            self.contact_labels = np.load(contact_labels_path, allow_pickle=True).item()
+            self.contact_mask = self.contact_labels["contact_mask"].astype(np.float32)
+        else:
+            self.contact_mask = np.zeros((self.ref_motion["joint_pos"].shape[0], 4))
         self.init_at_first_frame = init_at_first_frame
         if init_at_first_frame:
             # No recentering: use world frame (robot already at first frame on terrain)
