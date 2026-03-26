@@ -24,7 +24,8 @@ Note sim2real requires running lidar slam code [link](https://github.com/Ericcsr
 ## Run sim2real(sim) with SLAM fusing with foot odom
 ```
 python run_controller.py (--use_sim) --config exported_policies/sirui_test/experiment.yaml --use_odom --use_slam
-python run_state_estimation.py --use_sim --visualize --use_slam
+python run_state_estimation.py --use_sim --visualize --use_slam --use_acc
+python acc_estimator_mp.py
 ```
 
 
