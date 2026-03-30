@@ -1,8 +1,12 @@
 """
 URDF to MuJoCo XML converter for static terrain/objects.
 Handles links with mesh geometry (visual and collision).
-MuJoCo uses convex hull for mesh collision, which is poor for height-map terrain.
-Use independent column boxes for collision instead.
+
+Terrain: with use_columns_for_collision=True (default in merge_terrain_into_scene), the mesh is
+sampled to a heightmap and approximated with box columns. With use_columns_for_collision=False, a
+single mesh collision geom is used (controller config: terrain_mesh_collision: true in mujoco_env).
+
+Note: MuJoCo mesh collision still uses a convex hull per mesh geom (not the column decomposition).
 """
 import os
 import xml.etree.ElementTree as ET

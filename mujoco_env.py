@@ -434,10 +434,16 @@ class MujocoRobot:
                     f"terrain_urdf not found: {terrain_path}\n"
                     f"  (resolved from config terrain_urdf: {terrain_urdf})"
                 )
+            # terrain_mesh_collision: use URDF mesh geom only (no heightmap -> box columns).
+            # If False, terrain_use_columns toggles column vs single mesh (see urdf_to_mujoco).
+            if config.get("terrain_mesh_collision", False):
+                use_columns_for_collision = False
+            else:
+                use_columns_for_collision = config.get("terrain_use_columns", True)
             merged_xml = merge_terrain_into_scene(
                 xml_path,
                 terrain_path,
-                use_columns_for_collision=config.get("terrain_use_columns", True),
+                use_columns_for_collision=use_columns_for_collision,
                 terrain_column_res=config.get("terrain_column_res", 0.2),
                 terrain_floor_threshold=config.get("terrain_floor_threshold", 0.02),
             )
@@ -470,7 +476,16 @@ class MujocoRobot:
             raise RuntimeError(msg) from e
 
         if terrain_urdf:
-            print(f"[MujocoRobot] Terrain loaded from {terrain_path}", flush=True)
+            if config.get("terrain_mesh_collision", False):
+                terr_col = "terrain collision: URDF mesh (no heightmap box columns)"
+            elif config.get("terrain_use_columns", True):
+                terr_col = (
+                    f"terrain collision: heightmap columns "
+                    f"(res={config.get('terrain_column_res', 0.2)})"
+                )
+            else:
+                terr_col = "terrain collision: URDF mesh (terrain_use_columns: false)"
+            print(f"[MujocoRobot] Terrain loaded from {terrain_path} — {terr_col}", flush=True)
 
         # Merge object from URDF when configured (object added LAST to preserve robot indices)
         object_urdf = config.get("object_urdf") or ""
