@@ -29,8 +29,13 @@ and wrists; green/blue/yellow/magenta when that limb is in contact (per contact_
 
 Optional --terrain-mesh: write a static URDF (same pattern as exported_policies/terrain_test/*.urdf) for the
 mesh; default output is '<mesh_stem>_terrain.urdf' next to the mesh (--terrain-urdf-out to override).
+If the mesh has multiple edge-disconnected components, they are written as separate OBJ files
+(<stem>_terrain_part000.obj, ...) and combined in one URDF (fixed joints from base_link). Use
+--terrain-no-split to keep a single mesh reference (original behavior).
 With --visualize, the terrain is merged into the scene (utils.urdf_to_mujoco.merge_terrain_into_scene) so
 the mesh / column collision is shown. Use --terrain-no-columns if the mesh is STL (heightmap columns use OBJ).
+
+Each motion frame logs left/right foot sole world z (height) after FK; use --no-print-foot-heights to disable.
 
 Usage (run from repo root, or pass absolute --robot-xml):
   python extract_contact_labels_from_motion.py --ref-motion path/to/ref.npz --output contacts.npy \\
@@ -41,7 +46,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import struct
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -99,33 +106,206 @@ def _load_robot(robot_xml: Path):
     return model, data
 
 
-def write_terrain_urdf_from_mesh(mesh_path: Path, urdf_out: Path) -> None:
+# Vertex quantization for shared-edge detection (matches typical mesh export precision).
+_MESH_VERTEX_ROUND = 6
+
+
+def _mesh_vertex_key(v: np.ndarray) -> tuple[float, float, float]:
+    return (round(float(v[0]), _MESH_VERTEX_ROUND), round(float(v[1]), _MESH_VERTEX_ROUND), round(float(v[2]), _MESH_VERTEX_ROUND))
+
+
+def _mesh_edge_key(a: np.ndarray, b: np.ndarray) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    ka, kb = _mesh_vertex_key(a), _mesh_vertex_key(b)
+    return (ka, kb) if ka <= kb else (kb, ka)
+
+
+def load_mesh_triangles(mesh_path: Path) -> np.ndarray:
     """
-    Write a minimal static URDF referencing the mesh (relative path from URDF directory).
-    Matches the style of exported_policies/terrain_test/*_terrain.urdf for merge_terrain_into_scene.
+    Load triangle soup as (N, 3, 3) float64. Supports .obj and .stl (ASCII or binary).
     """
     mesh_path = mesh_path.expanduser().resolve()
     if not mesh_path.is_file():
         raise FileNotFoundError(f"Terrain mesh not found: {mesh_path}")
-    urdf_out = urdf_out.expanduser().resolve()
-    urdf_out.parent.mkdir(parents=True, exist_ok=True)
-    rel = os.path.relpath(mesh_path, urdf_out.parent).replace("\\", "/")
-    xml = f"""<?xml version="1.0"?>
-<robot name="terrain">
-    <link name="base_link">
-        <visual name="terrain_visual">
+    suf = mesh_path.suffix.lower()
+    if suf == ".obj":
+        return _load_triangles_from_obj(mesh_path)
+    if suf == ".stl":
+        return _load_triangles_from_stl(mesh_path)
+    raise ValueError(f"Unsupported terrain mesh extension {suf!r} (use .obj or .stl)")
+
+
+def _load_triangles_from_obj(path: Path) -> np.ndarray:
+    vertices: list[list[float]] = []
+    triangles: list[list[int]] = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            if parts[0] == "v" and len(parts) >= 4:
+                vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            elif parts[0] == "f" and len(parts) >= 4:
+                idxs = []
+                for p in parts[1:]:
+                    vi = p.split("/")[0]
+                    idxs.append(int(vi))
+                # Triangulate fan (blender-style ngons)
+                for k in range(1, len(idxs) - 1):
+                    a, b, c = idxs[0], idxs[k], idxs[k + 1]
+                    triangles.append([a, b, c])
+    if not vertices or not triangles:
+        raise ValueError(f"No mesh geometry in OBJ: {path}")
+    v = np.asarray(vertices, dtype=np.float64)
+    tris = np.zeros((len(triangles), 3, 3), dtype=np.float64)
+    nvert = len(vertices)
+    for ti, tri in enumerate(triangles):
+        for j, ix in enumerate(tri):
+            ii = ix - 1 if ix > 0 else nvert + ix  # OBJ 1-based; negative = relative
+            if ii < 0 or ii >= nvert:
+                raise ValueError(f"Invalid vertex index {ix} in {path}")
+            tris[ti, j] = v[ii]
+    return tris
+
+
+def _load_triangles_from_stl(path: Path) -> np.ndarray:
+    data = path.read_bytes()
+    if len(data) >= 84:
+        n_tri = struct.unpack("<I", data[80:84])[0]
+        if 84 + n_tri * 50 == len(data):
+            return _load_triangles_from_stl_binary(data)
+    text = data.decode("utf-8", errors="replace")
+    if "facet" in text.lower() and "vertex" in text.lower():
+        return _load_triangles_from_stl_ascii(text)
+    raise ValueError(f"Unrecognized STL format: {path}")
+
+
+def _load_triangles_from_stl_binary(data: bytes) -> np.ndarray:
+    n = struct.unpack("<I", data[80:84])[0]
+    tris = np.empty((n, 3, 3), dtype=np.float64)
+    off = 84
+    for i in range(n):
+        chunk = data[off : off + 50]
+        off += 50
+        v = struct.unpack("<9f", chunk[12:48])
+        tris[i, 0] = v[0:3]
+        tris[i, 1] = v[3:6]
+        tris[i, 2] = v[6:9]
+    return tris
+
+
+def _load_triangles_from_stl_ascii(text: str) -> np.ndarray:
+    tris: list[list[list[float]]] = []
+    lines = [ln.strip() for ln in text.splitlines()]
+    i = 0
+    while i < len(lines):
+        if lines[i].lower().startswith("outer loop"):
+            i += 1
+            vs: list[list[float]] = []
+            for _ in range(3):
+                if i >= len(lines):
+                    break
+                parts = lines[i].split()
+                if len(parts) < 4 or parts[0].lower() != "vertex":
+                    break
+                vs.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                i += 1
+            if len(vs) == 3:
+                tris.append(vs)
+            continue
+        i += 1
+    if not tris:
+        raise ValueError("No triangles parsed from ASCII STL")
+    return np.asarray(tris, dtype=np.float64)
+
+
+def split_triangles_by_edge_connectivity(tris: np.ndarray) -> list[np.ndarray]:
+    """
+    Split (N,3,3) triangle array into edge-connected components (triangles sharing an edge).
+    Isolated triangles (no shared edges) are each their own component.
+    """
+    n = tris.shape[0]
+    if n == 0:
+        return []
+    edge_to_tris: dict[tuple, list[int]] = defaultdict(list)
+    for ti in range(n):
+        t = tris[ti]
+        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+            edge_to_tris[_mesh_edge_key(a, b)].append(ti)
+
+    adj: list[set[int]] = [set() for _ in range(n)]
+    for tlist in edge_to_tris.values():
+        if len(tlist) < 2:
+            continue
+        for j in range(len(tlist)):
+            for k in range(j + 1, len(tlist)):
+                u, v = tlist[j], tlist[k]
+                adj[u].add(v)
+                adj[v].add(u)
+
+    seen = [False] * n
+    out: list[np.ndarray] = []
+    for start in range(n):
+        if seen[start]:
+            continue
+        stack = [start]
+        seen[start] = True
+        idxs: list[int] = []
+        while stack:
+            u = stack.pop()
+            idxs.append(u)
+            for v in adj[u]:
+                if not seen[v]:
+                    seen[v] = True
+                    stack.append(v)
+        out.append(tris[idxs])
+    return out
+
+
+def write_obj_triangles(path: Path, tris: np.ndarray) -> None:
+    """Write (N,3,3) triangle soup as a minimal OBJ (deduplicated vertices)."""
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    vert_map: dict[tuple[float, float, float], int] = {}
+    verts: list[tuple[float, float, float]] = []
+    faces: list[tuple[int, int, int]] = []
+    for ti in range(tris.shape[0]):
+        tri_idx: list[int] = []
+        for k in range(3):
+            key = _mesh_vertex_key(tris[ti, k])
+            if key not in vert_map:
+                vert_map[key] = len(verts) + 1
+                verts.append(key)
+            tri_idx.append(vert_map[key])
+        faces.append((tri_idx[0], tri_idx[1], tri_idx[2]))
+    lines = [f"v {x} {y} {z}" for x, y, z in verts]
+    for a, b, c in faces:
+        lines.append(f"f {a} {b} {c}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _urdf_link_block(
+    link_name: str,
+    rel_mesh: str,
+    visual_name: str,
+    collision_name: str = "terrain_collision",
+) -> str:
+    return f"""    <link name="{link_name}">
+        <visual name="{visual_name}">
             <origin xyz="0 0 0" rpy="0 0 0"/>
             <geometry>
-                <mesh filename="{rel}" scale="1 1 1"/>
+                <mesh filename="{rel_mesh}" scale="1 1 1"/>
             </geometry>
             <material name="terrain_material">
                 <color rgba="0.5 0.5 0.5 1.0"/>
             </material>
         </visual>
-        <collision name="terrain_collision">
+        <collision name="{collision_name}">
             <origin xyz="0 0 0" rpy="0 0 0"/>
             <geometry>
-                <mesh filename="{rel}" scale="1 1 1"/>
+                <mesh filename="{rel_mesh}" scale="1 1 1"/>
             </geometry>
         </collision>
         <inertial>
@@ -133,9 +313,92 @@ def write_terrain_urdf_from_mesh(mesh_path: Path, urdf_out: Path) -> None:
             <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
         </inertial>
     </link>
+"""
+
+
+def write_terrain_urdf_from_mesh(
+    mesh_path: Path,
+    urdf_out: Path,
+    *,
+    split_components: bool = True,
+) -> None:
+    """
+    Write a minimal static URDF referencing the mesh (relative path from URDF directory).
+    Matches the style of exported_policies/terrain_test/*_terrain.urdf for merge_terrain_into_scene.
+
+    When split_components is True, the mesh is decomposed into edge-connected triangle components.
+    Multiple components are saved as separate OBJ files next to urdf_out and combined via fixed
+    joints from an empty base_link (utils.urdf_to_mujoco already iterates all links).
+    """
+    mesh_path = mesh_path.expanduser().resolve()
+    if not mesh_path.is_file():
+        raise FileNotFoundError(f"Terrain mesh not found: {mesh_path}")
+    urdf_out = urdf_out.expanduser().resolve()
+    urdf_out.parent.mkdir(parents=True, exist_ok=True)
+
+    if not split_components:
+        rel = os.path.relpath(mesh_path, urdf_out.parent).replace("\\", "/")
+        xml = f"""<?xml version="1.0"?>
+<robot name="terrain">
+{_urdf_link_block("base_link", rel, "terrain_visual")}
 </robot>
 """
-    urdf_out.write_text(xml, encoding="utf-8")
+        urdf_out.write_text(xml, encoding="utf-8")
+        print(f"[terrain] Wrote URDF {urdf_out} (--terrain-no-split)", flush=True)
+        return
+
+    tris = load_mesh_triangles(mesh_path)
+    parts = split_triangles_by_edge_connectivity(tris)
+    if len(parts) == 1:
+        rel = os.path.relpath(mesh_path, urdf_out.parent).replace("\\", "/")
+        xml = f"""<?xml version="1.0"?>
+<robot name="terrain">
+{_urdf_link_block("base_link", rel, "terrain_visual")}
+</robot>
+"""
+        urdf_out.write_text(xml, encoding="utf-8")
+        print(f"[terrain] Wrote URDF {urdf_out} (single connected mesh)", flush=True)
+        return
+
+    stem = urdf_out.stem
+    blocks: list[str] = [
+        '<?xml version="1.0"?>',
+        '<robot name="terrain">',
+        "    <link name=\"base_link\">",
+        "        <inertial>",
+        '            <mass value="0"/>',
+        '            <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>',
+        "        </inertial>",
+        "    </link>",
+    ]
+    for i, part_tris in enumerate(parts):
+        file_stem = f"{stem}_part{i:03d}"
+        link_name = f"terrain_part{i:03d}"
+        mesh_part_path = urdf_out.parent / f"{file_stem}.obj"
+        write_obj_triangles(mesh_part_path, part_tris)
+        rel = os.path.relpath(mesh_part_path, urdf_out.parent).replace("\\", "/")
+        joint_name = f"{file_stem}_joint"
+        blocks.append(
+            f'    <joint name="{joint_name}" type="fixed">\n'
+            f'        <parent link="base_link"/>\n'
+            f'        <child link="{link_name}"/>\n'
+            f'        <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+            f"    </joint>"
+        )
+        blocks.append(
+            _urdf_link_block(
+                link_name,
+                rel,
+                f"terrain_visual_{i}",
+                collision_name=f"terrain_collision_{i}",
+            )
+        )
+    blocks.append("</robot>")
+    urdf_out.write_text("\n".join(blocks) + "\n", encoding="utf-8")
+    print(
+        f"[terrain] Wrote URDF {urdf_out} ({len(parts)} disconnected components -> {stem}_part*.obj)",
+        flush=True,
+    )
 
 
 def _load_scene_with_terrain(
@@ -653,6 +916,16 @@ def main():
         default=0.02,
         help="Min height (m) for heightmap column collision",
     )
+    parser.add_argument(
+        "--terrain-no-split",
+        action="store_true",
+        help="Do not split terrain mesh into connected components; reference the original file only",
+    )
+    parser.add_argument(
+        "--no-print-foot-heights",
+        action="store_true",
+        help="Disable per-frame sole height lines (world z, left then right)",
+    )
     args = parser.parse_args()
 
     terrain_urdf_for_viz: Path | None = None
@@ -663,9 +936,8 @@ def main():
             if args.terrain_urdf_out is not None
             else (mesh.parent / f"{mesh.stem}_terrain.urdf")
         )
-        write_terrain_urdf_from_mesh(mesh, urdf_out)
+        write_terrain_urdf_from_mesh(mesh, urdf_out, split_components=not args.terrain_no_split)
         terrain_urdf_for_viz = urdf_out.resolve()
-        print(f"[terrain] Wrote URDF {terrain_urdf_for_viz}", flush=True)
     elif args.terrain_urdf is not None:
         terrain_urdf_for_viz = args.terrain_urdf.expanduser().resolve()
         if not terrain_urdf_for_viz.is_file():
@@ -698,6 +970,16 @@ def main():
         )
 
     foot_world = compute_foot_sole_world_positions(model, mj_data, qpos)
+    if not args.no_print_foot_heights:
+        print(
+            f"foot_height fps={fps:g}  format: frame z_left_sole z_right_sole (world m)",
+            flush=True,
+        )
+        for ti in range(foot_world.shape[0]):
+            print(
+                f"foot_height {ti} {foot_world[ti, 0, 2]:.6f} {foot_world[ti, 1, 2]:.6f}",
+                flush=True,
+            )
     cfg = dict(DEFAULT_DETECT_CONFIG)
     pos_f, vel, acc = kinematics_process(
         foot_world, fps, cfg["FILTER_ORDER"], cfg["FILTER_CUTOFF"]

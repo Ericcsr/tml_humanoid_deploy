@@ -1,5 +1,6 @@
 import os
 import pickle
+from typing import Optional
 
 import numpy as np
 import pybullet as pb
@@ -198,7 +199,7 @@ class KinematicsModel:
             raise ValueError("dq and omega must be provided for velocity estimation")
         pb.resetBasePositionAndOrientation(self.robot, root_pos, self.root_quat)
         self.root_pose = np.concatenate((root_pos, self.root_quat))
-        # get local root velocity
+        # Foot odom returns v in world frame; express in root body: v_b = R_wb^{-1} v_w
         root_vel = Rotation.from_quat(self.root_quat).inv().apply(root_vel)
         #return self.root_pose[:3], self.root_pose[3:], root_vel
         return root_pos_slam, self.root_quat, root_vel
@@ -215,6 +216,124 @@ class KinematicsModel:
         )  # use full kinematic chain
         pb.resetBasePositionAndOrientation(self.robot, root_pos_slam, root_quat_slam)
         return root_pos_slam, root_quat_slam, np.zeros(3)
+
+    def update_root_state_slam_only(
+        self,
+        q: np.ndarray,
+        dq: np.ndarray,
+        head_pos: Optional[np.ndarray] = None,
+        head_quat: Optional[np.ndarray] = None,
+        head_lin_vel: Optional[np.ndarray] = None,
+        head_ang_vel: Optional[np.ndarray] = None,
+    ):
+        """
+        Root pose from SLAM (Redis head_pos / head_quat) and leg FK; root linear velocity from
+        Redis head_lin_vel / head_ang_vel (world frame, lidar/head frame) and joint rates.
+
+        v_root_w = v_head_w - ω_root_w × r - v_head_from_joints_w,
+        ω_root_w = ω_head_w - ω_head_from_joints_w, with joint-induced velocities from PyBullet
+        at zero base twist (returned root_vel is linear in body frame, same as foot odom).
+        """
+        self.q = q
+        if head_pos is None or head_quat is None:
+            self.head_pos = pickle.loads(self.redis_client.get("head_pos"))  # type: ignore
+            self.head_quat = pickle.loads(self.redis_client.get("head_quat"))  # type: ignore
+        else:
+            self.head_pos = head_pos
+            self.head_quat = head_quat
+        if head_lin_vel is None:
+            head_lin_vel = pickle.loads(self.redis_client.get("head_lin_vel"))  # type: ignore
+        if head_ang_vel is None:
+            head_ang_vel = pickle.loads(self.redis_client.get("head_ang_vel"))  # type: ignore
+        head_lin_vel = np.asarray(head_lin_vel, dtype=np.float64).reshape(3)
+        head_ang_vel = np.asarray(head_ang_vel, dtype=np.float64).reshape(3)
+
+        root_pos, root_quat = get_root_pose_from_link(
+            self.robot, self.mocap_link_id, self.q, self.head_pos, self.head_quat
+        )
+        root_pos = np.asarray(root_pos, dtype=np.float64)
+        root_quat = np.asarray(root_quat, dtype=np.float64)
+        pose = np.zeros(7, dtype=np.float32)
+        pose[:3] = root_pos.astype(np.float32)
+        pose[3:] = root_quat.astype(np.float32)
+        self.set_robot_state(q, pose, dq, omega=np.zeros(3, dtype=np.float64))
+        ls = pb.getLinkState(
+            self.robot,
+            self.mocap_link_id,
+            computeForwardKinematics=True,
+            computeLinkVelocity=True,
+        )
+        p_mocap = np.asarray(ls[4], dtype=np.float64)
+        v_head_joints = np.asarray(ls[6], dtype=np.float64)
+        w_head_joints = np.asarray(ls[7], dtype=np.float64)
+
+        w_root_w = head_ang_vel - w_head_joints
+        r = p_mocap - root_pos
+        v_root_w = head_lin_vel - np.cross(w_root_w, r) - v_head_joints
+        root_vel = Rotation.from_quat(root_quat).inv().apply(v_root_w)  # world → root body
+
+        pb.resetBasePositionAndOrientation(self.robot, root_pos, root_quat)
+        self.root_quat = root_quat.astype(np.float32)
+        self.root_pose = np.concatenate((root_pos, root_quat))
+        return root_pos, root_quat, root_vel.astype(np.float32)
+
+    def update_root_state_slam_pos_fused_orn_foot_vel(
+        self,
+        q: np.ndarray,
+        imu_quat: np.ndarray,
+        dq: np.ndarray,
+        omega: np.ndarray,
+        head_pos: Optional[np.ndarray] = None,
+        head_quat: Optional[np.ndarray] = None,
+        ddq=None,
+        root_a=None,
+        tau=None,
+    ):
+        """
+        Hybrid estimator: root position entirely from SLAM FK + slam_pos_to_world (no foot-odo
+        position filter); orientation from IMU–SLAM fusion (QuaternionCollaborativeFilterSimple);
+        linear root velocity from foot odometry (same world→body convention as update_root_state).
+        """
+        self.q = q
+        if head_pos is None or head_quat is None:
+            self.head_pos = pickle.loads(self.redis_client.get("head_pos"))  # type: ignore
+            self.head_quat = pickle.loads(self.redis_client.get("head_quat"))  # type: ignore
+        else:
+            self.head_pos = head_pos
+            self.head_quat = head_quat
+
+        root_pos_slam, root_quat_slam = get_root_pose_from_link(
+            self.robot, self.mocap_link_id, self.q, self.head_pos, self.head_quat
+        )
+        root_pos_slam = np.asarray(root_pos_slam, dtype=np.float64)
+
+        self.root_quat = np.asarray(
+            self.quaternion_filter.update(imu_quat, root_quat_slam), dtype=np.float64
+        )
+        root_pos = np.asarray(
+            self.quaternion_filter.slam_pos_to_world(root_pos_slam), dtype=np.float64
+        )
+        self.root_pos = root_pos.astype(np.float32)
+
+        if not self.use_acc:
+            root_vel_world, _z = self.foot_odo.estimate_velocity(
+                q, dq, self.root_quat, omega
+            )
+        else:
+            if ddq is None or root_a is None or tau is None:
+                raise ValueError("ddq, root_a, and tau required when use_acc=True")
+            root_vel_world, _z = self.foot_odo.estimate_velocity(
+                q, dq, self.root_quat, omega, root_a, ddq, tau
+            )
+
+        # v_world from foot odom → body frame with fused root_orn (same R as update_root_state)
+        root_vel_body = Rotation.from_quat(self.root_quat).inv().apply(root_vel_world)
+        root_vel_body = np.asarray(root_vel_body, dtype=np.float32)
+        self.root_quat = self.root_quat.astype(np.float32)
+
+        pb.resetBasePositionAndOrientation(self.robot, root_pos, self.root_quat)
+        self.root_pose = np.concatenate((root_pos, self.root_quat))
+        return root_pos, self.root_quat, root_vel_body
 
     def get_track_site(self):
         self.set_robot_state(self.q, self.root_pose)

@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../contact_terrain_reconstruction"
+		},
+		{
+			"path": "../tml_humanoid_eval"
+		}
+	],
+	"settings": {}
+}

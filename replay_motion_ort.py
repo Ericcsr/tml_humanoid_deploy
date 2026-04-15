@@ -27,7 +27,7 @@ motion = np.load(args.motion)
 
 motion_length = motion["qpos"].shape[0]
 
-fps = 30#float(motion["fps"])
+fps = float(motion["fps"])
 
 init_root_pos = motion["qpos"][0,:3]
 init_root_pos[2] = 0  # set initial height to 0

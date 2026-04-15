@@ -217,14 +217,18 @@ if __name__ == "__main__":
     # When terrain/object + sim: init robot at first frame xy and heading (for placement)
     terrain_urdf = config.get("terrain_urdf") or ""
     terrain_urdf = str(terrain_urdf).strip() if terrain_urdf else ""
+    terrain_box_pos = config.get("terrain_box_pos")
+    terrain_box_size = config.get("terrain_box_size")
+    has_terrain_box = terrain_box_pos is not None and terrain_box_size is not None
     object_urdf = config.get("object_urdf") or ""
     object_urdf = str(object_urdf).strip() if object_urdf else ""
     object_motion = config.get("object_motion") or ""
     object_motion = str(object_motion).strip() if object_motion else ""
     has_object = bool(("object_urdf" in config and object_urdf) or ("object_motion" in config and object_motion))
     init_at_first_frame = bool(
-        ("terrain_urdf" in config and terrain_urdf and args.use_sim) or
-        (has_object and args.use_sim)
+        ("terrain_urdf" in config and terrain_urdf and args.use_sim)
+        or (has_terrain_box and args.use_sim)
+        or (has_object and args.use_sim)
     )
     if init_at_first_frame:
         from utils.params import ISAAC_TO_MUJOCO

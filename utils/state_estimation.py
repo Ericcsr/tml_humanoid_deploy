@@ -219,9 +219,12 @@ class RootPoseFilterSimple:
 
     def updateOdo(self, vel, z):
         self.last_pos += vel * self.dt
-        self.last_pos[2] = z
+        #self.last_pos[2] = z
         if self.slam_updated:
-            self.last_pos[:2] = self.last_pos[:2] * self.alpha + self.last_slam_pos[:2] * (
+            # self.last_pos[:2] = self.last_pos[:2] * self.alpha + self.last_slam_pos[:2] * (
+            #     1 - self.alpha
+            # )
+            self.last_pos = self.last_pos * self.alpha + self.last_slam_pos * (
                 1 - self.alpha
             )
 
@@ -281,11 +284,12 @@ class FootOdometer:
 
     def estimate_velocity(self, q, dq, quat, omega):
         """
-        q: joint angles
-        quat: root_orientation world frame
-        omega: root_angular_velocity
+        Returns root *linear* velocity in **world** frame (PyBullet link worldLinearVelocity convention).
+
+        q, dq: joint state; quat: root orientation xyzw (body→world, same as PyBullet base orn);
+        omega: root angular velocity in **body** frame (matches MuJoCo qvel[3:6] and typical IMU gyro).
         """
-        omega = Rotation.from_quat(quat).apply(omega)  # convert to world frame
+        omega = Rotation.from_quat(quat).apply(omega)  # body ω → world
         pose = np.zeros(7, dtype=np.float32)
         pose[3:] = quat.copy()
         self.pb_kin.set_robot_state(q, pose, dq, omega*0.0)
@@ -311,7 +315,7 @@ class FootOdometer:
         return self.last_velocity.copy(), z  # assume flat ground
 
 class ForceTorqueFootOdometer:
-    def __init__(self, robot_id, pb_kin, foot_link_names, visualization=False, alpha=0.99, contact_threshold=50.0):
+    def __init__(self, robot_id, pb_kin, foot_link_names, visualization=False, alpha=0.99, contact_threshold=10.0):
         self.robot_id = robot_id
         self.pb_kin = pb_kin
         self.foot_contact_ids = [self.pb_kin.link_names.index(name) for name in foot_link_names]

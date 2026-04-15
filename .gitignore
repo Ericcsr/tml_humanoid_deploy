@@ -1,3 +1,7 @@
 __pycache__/
 exported_policies/**/
 *.zip
+
+# Temp merged MuJoCo scenes (written under system temp via tempfile; ignore stragglers in repo root)
+/mujoco_scene_*.xml
+/mujoco_scene_obj_*.xml

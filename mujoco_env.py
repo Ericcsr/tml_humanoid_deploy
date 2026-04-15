@@ -308,6 +308,10 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None)
         model.opt.timestep = config.get("simulation_dt", 0.005)
         slow_down = config.get("slow_down", 1.0)
         rate = Rate(1 / (model.opt.timestep * slow_down))
+        # Redis SLAM mimic: pose + world-frame velocities (see run_state_estimation_slam_only / robot_model)
+        slam_redis_hz = float(config.get("slam_redis_hz", 200.0))
+        slam_redis_period = 1.0 / slam_redis_hz if slam_redis_hz > 0 else 0.1
+        torso_slam_body_id = model.body("torso_link").id
         ts = time.time()
         ts_acc = time.time()
         while True:
@@ -395,9 +399,24 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None)
                 torso_orn[:] = data.xquat[model.body("torso_link").id][[1,2,3,0]].copy()
             # viewer.render()
             now = time.time()
-            if now - ts > 0.1:
-                redis_client.set("head_pos", pickle.dumps(data.xpos[model.body("torso_link").id].copy()))
-                redis_client.set("head_quat", pickle.dumps(data.xquat[model.body("torso_link").id][[1,2,3,0]].copy()))
+            if now - ts >= slam_redis_period:
+                head_pos = data.xpos[torso_slam_body_id].copy()
+                head_quat_xyzw = data.xquat[torso_slam_body_id][[1, 2, 3, 0]].copy()
+                vel6 = np.zeros(6, dtype=np.float64)
+                mujoco.mj_objectVelocity(
+                    model,
+                    data,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    torso_slam_body_id,
+                    vel6,
+                    0,  # world frame: res[0:3] angular vel, res[3:6] linear vel
+                )
+                head_ang_vel_w = vel6[0:3].astype(np.float32)
+                head_lin_vel_w = vel6[3:6].astype(np.float32)
+                redis_client.set("head_pos", pickle.dumps(head_pos))
+                redis_client.set("head_quat", pickle.dumps(head_quat_xyzw))
+                redis_client.set("head_lin_vel", pickle.dumps(head_lin_vel_w))
+                redis_client.set("head_ang_vel", pickle.dumps(head_ang_vel_w))
                 ts = now
             if now - ts_acc > 0.02:
                 root_rot = data.xmat[1].reshape(3, 3) 
@@ -423,34 +442,73 @@ class MujocoRobot:
         self._terrain_temp_file = None
         xml_path_to_load = xml_path
 
-        # Merge terrain from URDF only when explicitly configured (skip if absent or empty)
+        terrain_path = None
         terrain_urdf = config.get("terrain_urdf") or ""
         terrain_urdf = str(terrain_urdf).strip() if terrain_urdf else ""
+
+        tb_pos = config.get("terrain_box_pos")
+        tb_size = config.get("terrain_box_size")
+        has_terrain_box = tb_pos is not None and tb_size is not None
+
+        scene_dirty = False
+        with open(xml_path, "r") as f:
+            scene_xml = f.read()
+
+        if has_terrain_box:
+            from utils.urdf_to_mujoco import merge_terrain_box_into_scene_xml
+
+            pos_t = tuple(float(x) for x in tb_pos)
+            size_t = tuple(float(x) for x in tb_size)
+            if len(pos_t) != 3 or len(size_t) != 3:
+                raise ValueError(
+                    "terrain_box_pos and terrain_box_size must each be length-3 lists [x,y,z] / [lx,ly,lz]"
+                )
+            if min(size_t) <= 0:
+                raise ValueError("terrain_box_size entries must be positive (full dimensions in meters)")
+            tb_rgba = config.get("terrain_box_rgba")
+            if tb_rgba is not None:
+                rgba_t = tuple(float(x) for x in tb_rgba)
+                if len(rgba_t) != 4:
+                    raise ValueError("terrain_box_rgba must be length-4 [r,g,b,a]")
+                scene_xml = merge_terrain_box_into_scene_xml(scene_xml, pos_t, size_t, rgba_t)
+            else:
+                scene_xml = merge_terrain_box_into_scene_xml(scene_xml, pos_t, size_t)
+            scene_dirty = True
+            print(
+                f"[MujocoRobot] Procedural terrain box center={pos_t} full_size={size_t} (m)",
+                flush=True,
+            )
+
         if "terrain_urdf" in config and terrain_urdf:
-            from utils.urdf_to_mujoco import merge_terrain_into_scene
+            from utils.urdf_to_mujoco import merge_terrain_into_scene_from_string
+
             terrain_path = os.path.abspath(terrain_urdf) if os.path.isabs(terrain_urdf) else os.path.normpath(os.path.join(os.getcwd(), terrain_urdf))
             if not os.path.exists(terrain_path):
                 raise FileNotFoundError(
                     f"terrain_urdf not found: {terrain_path}\n"
                     f"  (resolved from config terrain_urdf: {terrain_urdf})"
                 )
-            # terrain_mesh_collision: use URDF mesh geom only (no heightmap -> box columns).
-            # If False, terrain_use_columns toggles column vs single mesh (see urdf_to_mujoco).
             if config.get("terrain_mesh_collision", False):
                 use_columns_for_collision = False
             else:
                 use_columns_for_collision = config.get("terrain_use_columns", True)
-            merged_xml = merge_terrain_into_scene(
-                xml_path,
+            scene_xml = merge_terrain_into_scene_from_string(
+                scene_xml,
                 terrain_path,
                 use_columns_for_collision=use_columns_for_collision,
                 terrain_column_res=config.get("terrain_column_res", 0.2),
                 terrain_floor_threshold=config.get("terrain_floor_threshold", 0.02),
             )
-            fd, self._terrain_temp_file = tempfile.mkstemp(suffix=".xml", prefix="mujoco_scene_", dir=os.getcwd())
+            scene_dirty = True
+
+        if scene_dirty:
+            fd, self._terrain_temp_file = tempfile.mkstemp(
+                suffix=".xml",
+                prefix="mujoco_scene_",
+            )
             try:
                 with os.fdopen(fd, "w") as f:
-                    f.write(merged_xml)
+                    f.write(scene_xml)
                 xml_path_to_load = self._terrain_temp_file
             except Exception:
                 os.close(fd)
@@ -468,14 +526,16 @@ class MujocoRobot:
                 f"Failed to load MuJoCo model from {xml_path_to_load}\n"
                 f"  Error: {e}\n"
             )
-            if terrain_urdf:
+            if terrain_urdf and terrain_path is not None:
                 msg += (
                     f"  Terrain was merged from: {terrain_path}\n"
                     f"  Check that the URDF and mesh file exist and are valid."
                 )
+            if has_terrain_box:
+                msg += "  Check terrain_box_pos / terrain_box_size and scene XML.\n"
             raise RuntimeError(msg) from e
 
-        if terrain_urdf:
+        if terrain_urdf and terrain_path is not None:
             if config.get("terrain_mesh_collision", False):
                 terr_col = "terrain collision: URDF mesh (no heightmap box columns)"
             elif config.get("terrain_use_columns", True):
@@ -498,7 +558,10 @@ class MujocoRobot:
             with open(xml_path_to_load, "r") as f:
                 scene_xml = f.read()
             merged_xml = merge_object_into_scene(scene_xml, object_path)
-            fd_obj, obj_temp = tempfile.mkstemp(suffix=".xml", prefix="mujoco_scene_obj_", dir=os.getcwd())
+            fd_obj, obj_temp = tempfile.mkstemp(
+                suffix=".xml",
+                prefix="mujoco_scene_obj_",
+            )
             try:
                 with os.fdopen(fd_obj, "w") as f:
                     f.write(merged_xml)

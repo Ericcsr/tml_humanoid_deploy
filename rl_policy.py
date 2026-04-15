@@ -10,6 +10,11 @@ from scipy.spatial.transform import Rotation
 from pynput import keyboard
 from threading import Lock
 
+import sys
+import numpy.core.multiarray as multiarray
+
+# Redirect the specific path the pickle is looking for
+sys.modules['numpy._core.multiarray'] = multiarray
 ### Helper classes
 class KeyboardController:
     def __init__(self):
@@ -289,6 +294,10 @@ class RLCHIPPolicy(RLBasePolicy):
         super().__init__(onnx_model_path, obs_names)
         default_joint_pos = self.meta_data["default_joint_pos"].split(",") if "default_joint_pos" in self.meta_data else RLCHIPPolicy.DEFAULT_Q_POSE
         action_scale = self.meta_data["action_scale"].split(",") if "action_scale" in self.meta_data else RLCHIPPolicy.ACTION_SCALE
+        if "default_joint_pos" in self.meta_data:
+            default_joint_pos = np.array([float(x) for x in self.meta_data["default_joint_pos"].split(",")])
+        if "action_scale" in self.meta_data:
+            action_scale = np.array([float(x) for x in self.meta_data["action_scale"].split(",")])
         self.default_value = {
             "q": np.array(default_joint_pos),
             "dq": np.zeros(29)

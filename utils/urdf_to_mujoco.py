@@ -7,6 +7,9 @@ sampled to a heightmap and approximated with box columns. With use_columns_for_c
 single mesh collision geom is used (controller config: terrain_mesh_collision: true in mujoco_env).
 
 Note: MuJoCo mesh collision still uses a convex hull per mesh geom (not the column decomposition).
+
+Procedural box terrain (no URDF): mujoco_env reads config keys terrain_box_pos, terrain_box_size
+(full dimensions); see merge_terrain_box_into_scene_xml.
 """
 import os
 import xml.etree.ElementTree as ET
@@ -383,6 +386,82 @@ def merge_object_into_scene(scene_xml: str, object_urdf_path: str) -> str:
     return scene_xml
 
 
+def _insert_after_worldbody_open(scene_xml: str, body_fragment: str) -> str:
+    """Insert a worldbody child right after <worldbody> ... newline (same as terrain insert)."""
+    worldbody_start = scene_xml.find("<worldbody>")
+    if worldbody_start < 0:
+        return scene_xml
+    insert_pos = scene_xml.find(">", worldbody_start) + 1
+    while insert_pos < len(scene_xml) and scene_xml[insert_pos] in " \t\n":
+        insert_pos += 1
+    return scene_xml[:insert_pos] + "\n" + body_fragment + "\n    " + scene_xml[insert_pos:]
+
+
+def merge_terrain_box_into_scene_xml(
+    scene_xml: str,
+    pos_xyz: Tuple[float, float, float],
+    size_xyz: Tuple[float, float, float],
+    rgba: Tuple[float, float, float, float] = (0.55, 0.52, 0.48, 1.0),
+) -> str:
+    """
+    Insert a static axis-aligned box (world body) — simple procedural terrain / platform.
+
+    Args:
+        pos_xyz: World position of the box center (m).
+        size_xyz: Full outer dimensions (lx, ly, lz) in meters; converted to MuJoCo half-sizes.
+        rgba: Visual/collision rgba (alpha only affects visualization).
+
+    The body is named ``terrain_box``; geom ``terrain_box_geom``.
+    """
+    hx = float(size_xyz[0]) / 2.0
+    hy = float(size_xyz[1]) / 2.0
+    hz = float(size_xyz[2]) / 2.0
+    px, py, pz = float(pos_xyz[0]), float(pos_xyz[1]), float(pos_xyz[2])
+    r, g, b, a = float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3])
+    body_xml = (
+        f'    <body name="terrain_box" pos="{px} {py} {pz}" quat="1 0 0 0">\n'
+        f'      <geom name="terrain_box_geom" type="box" pos="0 0 0" size="{hx} {hy} {hz}" '
+        f'contype="1" conaffinity="1" rgba="{r} {g} {b} {a}"/>\n'
+        f"    </body>"
+    )
+    return _insert_after_worldbody_open(scene_xml, body_xml)
+
+
+def merge_terrain_into_scene_from_string(
+    scene_xml: str,
+    terrain_urdf_path: str,
+    use_columns_for_collision: bool = True,
+    terrain_column_res: float = 0.2,
+    terrain_floor_threshold: float = 0.02,
+) -> str:
+    """
+    Merge terrain URDF into an in-memory MJCF string (same as merge_terrain_into_scene, no file read).
+    """
+    mesh_xml, body_xml = urdf_to_mujoco_xml(
+        terrain_urdf_path,
+        use_columns_for_collision=use_columns_for_collision,
+        terrain_column_res=terrain_column_res,
+        terrain_floor_threshold=terrain_floor_threshold,
+    )
+    if not mesh_xml or not body_xml:
+        return scene_xml
+
+    if "<asset>" in scene_xml and "</asset>" in scene_xml:
+        scene_xml = scene_xml.replace("</asset>", "\n" + mesh_xml + "\n  </asset>")
+    else:
+        insert = f"  <asset>\n{mesh_xml}\n  </asset>\n  "
+        scene_xml = scene_xml.replace("<worldbody>", insert + "<worldbody>")
+
+    worldbody_start = scene_xml.find("<worldbody>")
+    if worldbody_start >= 0:
+        insert_pos = scene_xml.find(">", worldbody_start) + 1
+        while insert_pos < len(scene_xml) and scene_xml[insert_pos] in " \t\n":
+            insert_pos += 1
+        scene_xml = scene_xml[:insert_pos] + "\n" + body_xml + "\n    " + scene_xml[insert_pos:]
+
+    return scene_xml
+
+
 def merge_terrain_into_scene(
     scene_xml_path: str,
     terrain_urdf_path: str,
@@ -398,33 +477,14 @@ def merge_terrain_into_scene(
     """
     with open(scene_xml_path, "r") as f:
         scene_xml = f.read()
-
-    mesh_xml, body_xml = urdf_to_mujoco_xml(
+    scene_xml = merge_terrain_into_scene_from_string(
+        scene_xml,
         terrain_urdf_path,
         use_columns_for_collision=use_columns_for_collision,
         terrain_column_res=terrain_column_res,
         terrain_floor_threshold=terrain_floor_threshold,
     )
-    if not mesh_xml or not body_xml:
-        return scene_xml
-
-    # Insert mesh assets before </asset>
-    if "<asset>" in scene_xml and "</asset>" in scene_xml:
-        scene_xml = scene_xml.replace("</asset>", "\n" + mesh_xml + "\n  </asset>")
-    else:
-        insert = f"  <asset>\n{mesh_xml}\n  </asset>\n  "
-        scene_xml = scene_xml.replace("<worldbody>", insert + "<worldbody>")
-
-    # Insert terrain body after <worldbody>
-    worldbody_start = scene_xml.find("<worldbody>")
-    if worldbody_start >= 0:
-        insert_pos = scene_xml.find(">", worldbody_start) + 1
-        while insert_pos < len(scene_xml) and scene_xml[insert_pos] in " \t\n":
-            insert_pos += 1
-        scene_xml = scene_xml[:insert_pos] + "\n" + body_xml + "\n    " + scene_xml[insert_pos:]
-
     if output_path:
         with open(output_path, "w") as f:
             f.write(scene_xml)
-
     return scene_xml

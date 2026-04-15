@@ -71,7 +71,7 @@ def redis_worker(shared_data, stop_event, redis_freq=50):
 def main():
     # 1. Initialization
     config = {"control_dt": 0.002, "joint_stiffness": [20]*29, "joint_damping": [0.5]*29}
-    robot = UnitreeRobot(net="enx6c6e07296d44", config=config)
+    robot = UnitreeRobot(net="enp5s0", config=config)
     estimator = AccelerationEstimator(num_joints=29, alpha_filter=0.15)
     
     # 2. Setup Multiprocessing
