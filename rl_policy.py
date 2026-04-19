@@ -473,6 +473,7 @@ class RLContactPolicy(RLBasePolicy):
         if contact_labels_path != "default":
             self.contact_labels = np.load(contact_labels_path, allow_pickle=True).item()
             self.contact_mask = self.contact_labels["contact_mask"].astype(np.float32)
+            #self.contact_mask[30:,2:] = 1
         else:
             self.contact_mask = np.zeros((self.ref_motion["joint_pos"].shape[0], 4))
         self.init_at_first_frame = init_at_first_frame

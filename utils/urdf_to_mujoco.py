@@ -10,6 +10,8 @@ Note: MuJoCo mesh collision still uses a convex hull per mesh geom (not the colu
 
 Procedural box terrain (no URDF): mujoco_env reads config keys terrain_box_pos, terrain_box_size
 (full dimensions); see merge_terrain_box_into_scene_xml.
+Dynamic free box (no URDF): mujoco_env reads config keys free_box_pos, free_box_size, free_box_mass;
+see merge_free_box_into_scene_xml.
 """
 import os
 import xml.etree.ElementTree as ET
@@ -422,6 +424,40 @@ def merge_terrain_box_into_scene_xml(
         f'    <body name="terrain_box" pos="{px} {py} {pz}" quat="1 0 0 0">\n'
         f'      <geom name="terrain_box_geom" type="box" pos="0 0 0" size="{hx} {hy} {hz}" '
         f'contype="1" conaffinity="1" rgba="{r} {g} {b} {a}"/>\n'
+        f"    </body>"
+    )
+    return _insert_after_worldbody_open(scene_xml, body_xml)
+
+
+def merge_free_box_into_scene_xml(
+    scene_xml: str,
+    pos_xyz: Tuple[float, float, float],
+    size_xyz: Tuple[float, float, float],
+    mass: float,
+    rgba: Tuple[float, float, float, float] = (0.65, 0.45, 0.35, 1.0),
+) -> str:
+    """
+    Insert a dynamic axis-aligned box with a free joint.
+
+    Args:
+        pos_xyz: World position of the box center (m).
+        size_xyz: Full outer dimensions (lx, ly, lz) in meters; converted to MuJoCo half-sizes.
+        mass: Box mass in kg.
+        rgba: Visual/collision rgba (alpha only affects visualization).
+
+    The body is named ``free_box``; freejoint ``free_box_joint``; geom ``free_box_geom``.
+    """
+    hx = float(size_xyz[0]) / 2.0
+    hy = float(size_xyz[1]) / 2.0
+    hz = float(size_xyz[2]) / 2.0
+    px, py, pz = float(pos_xyz[0]), float(pos_xyz[1]), float(pos_xyz[2])
+    m = float(mass)
+    r, g, b, a = float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3])
+    body_xml = (
+        f'    <body name="free_box" pos="{px} {py} {pz}" quat="1 0 0 0">\n'
+        f'      <freejoint name="free_box_joint"/>\n'
+        f'      <geom name="free_box_geom" type="box" pos="0 0 0" size="{hx} {hy} {hz}" '
+        f'mass="{m}" contype="1" conaffinity="1" rgba="{r} {g} {b} {a}"/>\n'
         f"    </body>"
     )
     return _insert_after_worldbody_open(scene_xml, body_xml)

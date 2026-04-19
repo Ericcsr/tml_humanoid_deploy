@@ -88,5 +88,8 @@ while True:
                 pb.addUserDebugText("O", pb.getLinkState(robot, hand_ids[1])[0], textColorRGB=[1,0,0], textSize=3, lifeTime=2.0/fps)
         pb.resetBasePositionAndOrientation(robot, rel_root_pos, rel_root_orn)
         time.sleep(1.0 / fps)
+        print(i)
+        if i > 100:
+            input()
         #breakpoint()
     input("Press Enter to replay the motion...")

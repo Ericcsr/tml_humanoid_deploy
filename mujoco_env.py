@@ -449,6 +449,9 @@ class MujocoRobot:
         tb_pos = config.get("terrain_box_pos")
         tb_size = config.get("terrain_box_size")
         has_terrain_box = tb_pos is not None and tb_size is not None
+        fb_pos = config.get("free_box_pos")
+        fb_size = config.get("free_box_size")
+        has_free_box = fb_pos is not None and fb_size is not None
 
         scene_dirty = False
         with open(xml_path, "r") as f:
@@ -476,6 +479,38 @@ class MujocoRobot:
             scene_dirty = True
             print(
                 f"[MujocoRobot] Procedural terrain box center={pos_t} full_size={size_t} (m)",
+                flush=True,
+            )
+
+        if has_free_box:
+            from utils.urdf_to_mujoco import merge_free_box_into_scene_xml
+
+            pos_t = tuple(float(x) for x in fb_pos)
+            size_t = tuple(float(x) for x in fb_size)
+            if len(pos_t) != 3 or len(size_t) != 3:
+                raise ValueError(
+                    "free_box_pos and free_box_size must each be length-3 lists [x,y,z] / [lx,ly,lz]"
+                )
+            if min(size_t) <= 0:
+                raise ValueError("free_box_size entries must be positive (full dimensions in meters)")
+            free_box_mass = float(config.get("free_box_mass", 1.0))
+            if free_box_mass <= 0:
+                raise ValueError("free_box_mass must be > 0 (kg)")
+            fb_rgba = config.get("free_box_rgba")
+            if fb_rgba is not None:
+                rgba_t = tuple(float(x) for x in fb_rgba)
+                if len(rgba_t) != 4:
+                    raise ValueError("free_box_rgba must be length-4 [r,g,b,a]")
+                scene_xml = merge_free_box_into_scene_xml(
+                    scene_xml, pos_t, size_t, free_box_mass, rgba_t
+                )
+            else:
+                scene_xml = merge_free_box_into_scene_xml(
+                    scene_xml, pos_t, size_t, free_box_mass
+                )
+            scene_dirty = True
+            print(
+                f"[MujocoRobot] Procedural free box center={pos_t} full_size={size_t} (m), mass={free_box_mass:.3f} kg",
                 flush=True,
             )
 
@@ -533,6 +568,8 @@ class MujocoRobot:
                 )
             if has_terrain_box:
                 msg += "  Check terrain_box_pos / terrain_box_size and scene XML.\n"
+            if has_free_box:
+                msg += "  Check free_box_pos / free_box_size / free_box_mass and scene XML.\n"
             raise RuntimeError(msg) from e
 
         if terrain_urdf and terrain_path is not None:
