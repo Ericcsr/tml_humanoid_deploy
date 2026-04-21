@@ -3,9 +3,13 @@ import onnxruntime
 import torch
 import time
 import pickle
+import redis
+import pybullet as pb
+import os
 from utils.params import MUJOCO_TO_ISAAC, ISAAC_TO_MUJOCO
 from utils.math_utils import yaw_quat, yaw_quat_xyzw
 from utils.storage_utils import ObsQueue, HistoryBuffer
+from utils.redis_utils import REDIS_IP, REDIS_PORT
 from scipy.spatial.transform import Rotation
 from pynput import keyboard
 from threading import Lock
@@ -15,6 +19,64 @@ import numpy.core.multiarray as multiarray
 
 # Redirect the specific path the pickle is looking for
 sys.modules['numpy._core.multiarray'] = multiarray
+
+
+def _compute_initial_vr_3point_local_from_pybullet(
+    default_q_isaac,
+    urdf_path,
+    vr_3point_link_names,
+    vr_3point_offsets,
+    anchor_link_name,
+):
+    """Compute initial local 3-point targets (pos/orientation) from FK."""
+    client = pb.connect(pb.DIRECT)
+    try:
+        robot = pb.loadURDF(urdf_path, useFixedBase=True, physicsClientId=client)
+        num_joints = pb.getNumJoints(robot, physicsClientId=client)
+        revolute_joints = []
+        link_name_to_joint = {}
+        for j in range(num_joints):
+            ji = pb.getJointInfo(robot, j, physicsClientId=client)
+            if ji[2] == pb.JOINT_REVOLUTE:
+                revolute_joints.append(j)
+            link_name_to_joint[ji[12].decode("utf-8")] = j
+
+        q = np.asarray(default_q_isaac, dtype=np.float64).reshape(-1)
+        if len(revolute_joints) != q.size:
+            raise ValueError(f"FK mismatch: revolute joints {len(revolute_joints)} vs q size {q.size}")
+        pb.resetJointStatesMultiDof(
+            robot,
+            revolute_joints,
+            targetValues=q.reshape(-1, 1),
+            physicsClientId=client,
+        )
+
+        anchor_jid = link_name_to_joint[anchor_link_name]
+        anchor_state = pb.getLinkState(robot, anchor_jid, computeForwardKinematics=True, physicsClientId=client)
+        anchor_pos = np.array(anchor_state[4], dtype=np.float64)
+        anchor_orn = np.array(anchor_state[5], dtype=np.float64)  # xyzw
+        anchor_rot_inv = Rotation.from_quat(anchor_orn).inv()
+
+        pos_l = []
+        orn_l = []
+        for i, link_name in enumerate(vr_3point_link_names):
+            jid = link_name_to_joint[link_name]
+            state = pb.getLinkState(robot, jid, computeForwardKinematics=True, physicsClientId=client)
+            link_pos = np.array(state[4], dtype=np.float64)
+            link_orn = np.array(state[5], dtype=np.float64)  # xyzw
+            world_offset = Rotation.from_quat(link_orn).apply(vr_3point_offsets[i])
+            link_pos_offset = link_pos + world_offset
+            pos_l.append(anchor_rot_inv.apply(link_pos_offset - anchor_pos))
+            rel_orn = anchor_rot_inv * Rotation.from_quat(link_orn)
+            orn_l.append(rel_orn.as_quat(scalar_first=True))
+
+        return (
+            np.asarray(pos_l, dtype=np.float32).reshape(-1),
+            np.asarray(orn_l, dtype=np.float32).reshape(-1),
+        )
+    finally:
+        pb.disconnect(client)
+
 ### Helper classes
 class KeyboardController:
     def __init__(self):
@@ -473,7 +535,7 @@ class RLContactPolicy(RLBasePolicy):
         if contact_labels_path != "default":
             self.contact_labels = np.load(contact_labels_path, allow_pickle=True).item()
             self.contact_mask = self.contact_labels["contact_mask"].astype(np.float32)
-            #self.contact_mask[30:,2:] = 1
+            #self.contact_mask[28:,2:] = 1
         else:
             self.contact_mask = np.zeros((self.ref_motion["joint_pos"].shape[0], 4))
         self.init_at_first_frame = init_at_first_frame
@@ -575,6 +637,224 @@ class RLContactPolicy(RLBasePolicy):
         assert obs.shape == self.input_shape, f"Obs shape: {obs.shape}, input shape: {self.input_shape}"
         ort_inputs = {"obs": obs.astype(np.float32)}
                       #"time_step": np.array([[0.0]], dtype=np.float32)}
+        ort_outs = self.session.run(None, ort_inputs)
+        if start_ticker:
+            self.ticker += 1
+        elif self.ticker > 0:
+            self.ticker = 0
+        return ort_outs[0].flatten()
+
+
+class RLStreamingContactPolicy(RLBasePolicy):
+    """Contact policy variant that consumes latest commands from Redis pub/sub."""
+
+    def __init__(
+        self,
+        onnx_model_path,
+        obs_names,
+        lookahead_steps=1,
+        lookahead_frame_skips=1,
+        hist_names=[],
+        hist_length=10,
+        redis_ip=REDIS_IP,
+        redis_port=REDIS_PORT,
+        redis_channels=None,
+    ):
+        super().__init__(onnx_model_path, obs_names)
+        self.default_value = {
+            "q": np.array([float(x) for x in self.meta_data["default_joint_pos"].split(",")]),
+            "dq": np.zeros(29),
+        }
+        self.action_scale = np.array([float(x) for x in self.meta_data["action_scale"].split(",")])
+        if len(self.action_scale) != 29:
+            self.action_scale = np.ones(29) * self.action_scale
+        else:
+            self.action_scale = self.action_scale[ISAAC_TO_MUJOCO]
+
+        self.motion_length = int(1e9)
+        self.keyboard_controller = KeyboardController()
+        self.lower_cmd_dim = 24 * lookahead_steps
+        self.vr_pos_dim = 9
+        self.vr_orn_dim = 12
+        self.contact_dim = 4
+        self.anchor_pos_dim = 3
+        self.anchor_orn_dim = 4
+
+        self.lower_joint_indices = ISAAC_TO_MUJOCO[:12]
+        lower_q_default = self.default_value["q"][self.lower_joint_indices].astype(np.float32)
+        lower_dq_default = np.zeros_like(lower_q_default, dtype=np.float32)
+        lower_cmd_single = np.hstack([lower_q_default, lower_dq_default]).astype(np.float32)
+        self.latest_lower_cmd = np.tile(lower_cmd_single, lookahead_steps)
+
+        self.vr_3point_offsets = np.array(
+            [[0.18, -0.025, 0.0], [0.18, 0.025, 0.0], [0.0, 0.0, 0.35]],
+            dtype=np.float32,
+        )
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.fk_urdf_path = os.path.join(script_dir, "assets", "g1", "g1_29dof_kin_extended.urdf")
+        self.vr_3point_link_names = ["left_wrist_yaw_link", "right_wrist_yaw_link", "torso_link"]
+        try:
+            vr_pos_init, vr_orn_init = _compute_initial_vr_3point_local_from_pybullet(
+                self.default_value["q"],
+                self.fk_urdf_path,
+                self.vr_3point_link_names,
+                self.vr_3point_offsets,
+                anchor_link_name="torso_link",
+            )
+            self.latest_vr_3point_pos = vr_pos_init
+            self.latest_vr_3point_orn = vr_orn_init
+        except Exception as exc:
+            print(f"[RLStreamingContactPolicy] FK init failed ({exc}), falling back to zeros.", flush=True)
+            self.latest_vr_3point_pos = np.zeros(self.vr_pos_dim, dtype=np.float32)
+            self.latest_vr_3point_orn = np.zeros(self.vr_orn_dim, dtype=np.float32)
+            self.latest_vr_3point_orn[0] = 1.0
+            self.latest_vr_3point_orn[4] = 1.0
+            self.latest_vr_3point_orn[8] = 1.0
+
+        self.latest_contact_mask = np.zeros(self.contact_dim, dtype=np.float32)
+        self.latest_motion_anchor_pos_w = np.zeros(self.anchor_pos_dim, dtype=np.float32)
+        self.latest_motion_anchor_orn_w = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)  # xyzw
+        self.received_any_stream = False
+        self._stream_msg_count = 0
+        self._last_stream_warn_t = 0.0
+        self._last_stream_info_t = 0.0
+
+        if hist_length > 1:
+            self.history_buffer = HistoryBuffer(hist_length, obs_names=hist_names, flatten=True)
+
+        if redis_channels is None:
+            redis_channels = {
+                "lower_cmd": "lower_cmd",
+                "vr_3point_pos_l": "vr_3point_pos_l",
+                "vr_3point_orn_l": "vr_3point_orn_l",
+                "contact_mask": "contact_mask",
+                "motion_anchor_pos_w": "motion_anchor_pos_w",
+                "motion_anchor_orn_w": "motion_anchor_orn_w",
+            }
+        self.redis_channels = redis_channels
+        self.redis_client = redis.Redis(host=redis_ip, port=redis_port, db=0)
+        self.pubsub = self.redis_client.pubsub(ignore_subscribe_messages=True)
+        self.pubsub.subscribe(
+            self.redis_channels["lower_cmd"],
+            self.redis_channels["vr_3point_pos_l"],
+            self.redis_channels["vr_3point_orn_l"],
+            self.redis_channels["contact_mask"],
+            self.redis_channels["motion_anchor_pos_w"],
+            self.redis_channels["motion_anchor_orn_w"],
+        )
+        self._channel_to_key = {
+            self.redis_channels["lower_cmd"]: "lower_cmd",
+            self.redis_channels["vr_3point_pos_l"]: "vr_3point_pos_l",
+            self.redis_channels["vr_3point_orn_l"]: "vr_3point_orn_l",
+            self.redis_channels["contact_mask"]: "contact_mask",
+            self.redis_channels["motion_anchor_pos_w"]: "motion_anchor_pos_w",
+            self.redis_channels["motion_anchor_orn_w"]: "motion_anchor_orn_w",
+        }
+        print(
+            f"[RLStreamingContactPolicy] Listening Redis channels:"
+            f" {self.redis_channels['lower_cmd']}, {self.redis_channels['vr_3point_pos_l']},"
+            f" {self.redis_channels['vr_3point_orn_l']}, {self.redis_channels['contact_mask']},"
+            f" {self.redis_channels['motion_anchor_pos_w']}, {self.redis_channels['motion_anchor_orn_w']}"
+        )
+
+    def get_q_init(self):
+        return self.default_value["q"][ISAAC_TO_MUJOCO].copy()
+
+    @staticmethod
+    def _decode_array(payload, expected_dim, allow_single_tile_for_lower=False):
+        arr = pickle.loads(payload)
+        arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+        if allow_single_tile_for_lower and expected_dim % 24 == 0 and arr.size == 24 and expected_dim > 24:
+            arr = np.tile(arr, expected_dim // 24)
+        if arr.size != expected_dim:
+            raise ValueError(f"Expected payload size {expected_dim}, got {arr.size}")
+        return arr
+
+    def _pull_latest_commands(self):
+        while True:
+            msg = self.pubsub.get_message(timeout=0.0)
+            if msg is None:
+                break
+            if msg.get("type") != "message":
+                continue
+            channel = msg["channel"]
+            if isinstance(channel, bytes):
+                channel = channel.decode("utf-8")
+            data = msg["data"]
+            if not isinstance(data, (bytes, bytearray)):
+                continue
+            try:
+                key = self._channel_to_key.get(channel)
+                if key == "lower_cmd":
+                    self.latest_lower_cmd = self._decode_array(
+                        data,
+                        self.lower_cmd_dim,
+                        allow_single_tile_for_lower=True,
+                    )
+                elif key == "vr_3point_pos_l":
+                    self.latest_vr_3point_pos = self._decode_array(data, self.vr_pos_dim)
+                elif key == "vr_3point_orn_l":
+                    self.latest_vr_3point_orn = self._decode_array(data, self.vr_orn_dim)
+                elif key == "contact_mask":
+                    self.latest_contact_mask = self._decode_array(data, self.contact_dim)
+                elif key == "motion_anchor_pos_w":
+                    self.latest_motion_anchor_pos_w = self._decode_array(data, self.anchor_pos_dim)
+                elif key == "motion_anchor_orn_w":
+                    self.latest_motion_anchor_orn_w = self._decode_array(data, self.anchor_orn_dim)
+                self.received_any_stream = True
+                self._stream_msg_count += 1
+            except Exception as exc:
+                now = time.time()
+                if now - self._last_stream_warn_t > 2.0:
+                    print(f"[RLStreamingContactPolicy] Stream decode warning on channel '{channel}': {exc}", flush=True)
+                    self._last_stream_warn_t = now
+                continue
+
+    def prepare_control_signals(self, robot_state):
+        self._pull_latest_commands()
+        now = time.time()
+        if self.received_any_stream:
+            if now - self._last_stream_info_t > 2.0:
+                print(f"[RLStreamingContactPolicy] stream alive: messages={self._stream_msg_count}", flush=True)
+                self._last_stream_info_t = now
+        else:
+            if now - self._last_stream_warn_t > 2.0:
+                print("[RLStreamingContactPolicy] waiting for stream packets...", flush=True)
+                self._last_stream_warn_t = now
+        anchor_rot_inv = Rotation.from_quat(robot_state.root_orn).inv()
+        target_anchor_rot = Rotation.from_quat(self.latest_motion_anchor_orn_w)
+        control_signals = {
+            "lower_command": self.latest_lower_cmd.copy(),
+            "vr_3point_pos": self.latest_vr_3point_pos.copy(),
+            "vr_3point_ori": self.latest_vr_3point_orn.copy(),
+            "contact_mask": self.latest_contact_mask.copy(),
+            "compliance": self.keyboard_controller.get_compliance(),
+            "motion_anchor_pos_b": anchor_rot_inv.apply(self.latest_motion_anchor_pos_w - robot_state.root_pos).astype(np.float32),
+            "motion_anchor_ori_b": (anchor_rot_inv * target_anchor_rot).as_matrix()[:, :2].reshape(-1).astype(np.float32),
+        }
+        control_signals["projected_gravity"] = anchor_rot_inv.apply(np.array([0, 0, -1]))
+        return control_signals
+
+    def prepare_obs(self, robot_state, control_signals):
+        obs = []
+        robot_state_keys = list(robot_state.__dict__.keys())
+        for key in self.obs_names:
+            if key in robot_state_keys:
+                if key in ["q", "dq"]:
+                    item = robot_state.__dict__[key][MUJOCO_TO_ISAAC] - self.default_value[key]
+                else:
+                    item = robot_state.__dict__[key]
+            else:
+                item = control_signals[key]
+            if hasattr(self, "history_buffer") and key in self.history_buffer.buffer_dict:
+                self.history_buffer.add(key, item)
+                item = self.history_buffer.get_history(key)
+            obs.append(item)
+        return np.concatenate(obs).reshape(1, -1)
+
+    def get_action(self, obs, start_ticker=False):
+        assert obs.shape == self.input_shape, f"Obs shape: {obs.shape}, input shape: {self.input_shape}"
+        ort_inputs = {"obs": obs.astype(np.float32)}
         ort_outs = self.session.run(None, ort_inputs)
         if start_ticker:
             self.ticker += 1

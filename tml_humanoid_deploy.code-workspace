@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "../tml_humanoid_eval"
+		},
+		{
+			"path": "../robot_motion_stitching"
 		}
 	],
 	"settings": {}
