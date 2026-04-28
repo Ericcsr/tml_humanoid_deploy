@@ -191,7 +191,6 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
 
         scaled_action = action[ISAAC_TO_MUJOCO] * policy.action_scale + policy.default_value["q"][ISAAC_TO_MUJOCO]
         env.step_robot(scaled_action)
-        
         rate.sleep()
 
 if __name__ == "__main__":
