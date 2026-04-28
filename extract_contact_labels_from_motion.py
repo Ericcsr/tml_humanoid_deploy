@@ -408,6 +408,7 @@ def _load_scene_with_terrain(
     use_columns_for_collision: bool,
     terrain_column_res: float,
     terrain_floor_threshold: float,
+    terrain_urdf_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> tuple[mujoco.MjModel, mujoco.MjData]:
     """Load robot scene XML from disk and merge terrain URDF (same as MujocoRobot / urdf_to_mujoco)."""
     from utils.urdf_to_mujoco import merge_terrain_into_scene
@@ -425,6 +426,7 @@ def _load_scene_with_terrain(
         use_columns_for_collision=use_columns_for_collision,
         terrain_column_res=terrain_column_res,
         terrain_floor_threshold=terrain_floor_threshold,
+        terrain_urdf_offset=terrain_urdf_offset,
     )
     old_cwd = os.getcwd()
     try:
@@ -917,6 +919,14 @@ def main():
         help="Min height (m) for heightmap column collision",
     )
     parser.add_argument(
+        "--terrain-urdf-offset",
+        nargs=3,
+        type=float,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help="World translation (m) for merged terrain URDF (--visualize only); default 0 0 0",
+    )
+    parser.add_argument(
         "--terrain-no-split",
         action="store_true",
         help="Do not split terrain mesh into connected components; reference the original file only",
@@ -1035,12 +1045,15 @@ def main():
     if args.visualize:
         hand_world = _try_compute_hand_world(model, mj_data, qpos)
         if terrain_urdf_for_viz is not None:
+            t_off = args.terrain_urdf_offset
+            terrain_urdf_offset = (0.0, 0.0, 0.0) if t_off is None else (float(t_off[0]), float(t_off[1]), float(t_off[2]))
             v_model, v_data = _load_scene_with_terrain(
                 args.robot_xml,
                 terrain_urdf_for_viz,
                 use_columns_for_collision=not args.terrain_no_columns,
                 terrain_column_res=args.terrain_column_res,
                 terrain_floor_threshold=args.terrain_floor_threshold,
+                terrain_urdf_offset=terrain_urdf_offset,
             )
             if v_model.nq != model.nq:
                 raise ValueError(

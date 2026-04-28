@@ -229,6 +229,7 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None)
         left_wrist_body_id = None
         right_wrist_body_id = None
         object_position_from_hand_center = bool(config.get("object_position_from_hand_center", False))
+        object_motion_init_only = bool(config.get("object_motion_init_only", False))
         if object_position_from_hand_center:
             vho = config.get("vr_3point_hand_offsets")
             if vho is not None:
@@ -265,11 +266,19 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None)
                     if object_position_from_hand_center
                     else "trajectory pose"
                 )
-                print(
-                    f"[run_simulation] Object loaded: {object_trans.shape[0]} frames, position={pos_mode} "
-                    f"(kinematic until both wrists contact)",
-                    flush=True,
-                )
+                if object_motion_init_only:
+                    object_kinematic_released = True
+                    print(
+                        f"[run_simulation] Object loaded: {object_trans.shape[0]} frames, position={pos_mode} "
+                        f"(first frame only; physics-only afterward)",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[run_simulation] Object loaded: {object_trans.shape[0]} frames, position={pos_mode} "
+                        f"(kinematic until both wrists contact)",
+                        flush=True,
+                    )
             except Exception as e:
                 print(f"[run_simulation] Object init failed: {e}", flush=True)
                 object_trans = None
@@ -309,7 +318,7 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None)
         slow_down = config.get("slow_down", 1.0)
         rate = Rate(1 / (model.opt.timestep * slow_down))
         # Redis SLAM mimic: pose + world-frame velocities (see run_state_estimation_slam_only / robot_model)
-        slam_redis_hz = float(config.get("slam_redis_hz", 200.0))
+        slam_redis_hz = float(config.get("slam_redis_hz", 10.0))
         slam_redis_period = 1.0 / slam_redis_hz if slam_redis_hz > 0 else 0.1
         torso_slam_body_id = model.body("torso_link").id
         ts = time.time()
@@ -448,7 +457,20 @@ class MujocoRobot:
 
         tb_pos = config.get("terrain_box_pos")
         tb_size = config.get("terrain_box_size")
-        has_terrain_box = tb_pos is not None and tb_size is not None
+        terrain_boxes_cfg = config.get("terrain_boxes")
+        has_terrain_box_legacy = tb_pos is not None and tb_size is not None
+        has_terrain_box_multi = False
+        if isinstance(terrain_boxes_cfg, dict):
+            has_terrain_box_multi = len(terrain_boxes_cfg) > 0
+        elif isinstance(terrain_boxes_cfg, list):
+            has_terrain_box_multi = len(terrain_boxes_cfg) > 0
+        elif terrain_boxes_cfg is not None:
+            raise TypeError("terrain_boxes must be a dict, a list, or omitted (not a single box)")
+        if has_terrain_box_legacy and has_terrain_box_multi:
+            raise ValueError(
+                "Use either terrain_box_pos/terrain_box_size (single box) or terrain_boxes, not both"
+            )
+        has_terrain_box = has_terrain_box_legacy or has_terrain_box_multi
         fb_pos = config.get("free_box_pos")
         fb_size = config.get("free_box_size")
         has_free_box = fb_pos is not None and fb_size is not None
@@ -457,7 +479,81 @@ class MujocoRobot:
         with open(xml_path, "r") as f:
             scene_xml = f.read()
 
-        if has_terrain_box:
+        if has_terrain_box_multi:
+            from utils.urdf_to_mujoco import merge_terrain_boxes_into_scene_xml
+
+            default_rgba = (0.55, 0.52, 0.48, 1.0)
+            boxes: list = []
+            if isinstance(terrain_boxes_cfg, dict):
+                for name, spec in terrain_boxes_cfg.items():
+                    if not isinstance(spec, dict):
+                        raise TypeError(f"terrain_boxes[{name!r}] must be a dict with pos, size, ...")
+                    pos_ = spec.get("pos")
+                    size_ = spec.get("size")
+                    if pos_ is None or size_ is None:
+                        raise ValueError(
+                            f"terrain_boxes[{name!r}] must include pos and size (length-3 each)"
+                        )
+                    pos_t = tuple(float(x) for x in pos_)
+                    size_t = tuple(float(x) for x in size_)
+                    if len(pos_t) != 3 or len(size_t) != 3:
+                        raise ValueError(
+                            f"terrain_boxes[{name!r}]: pos and size must be length-3 [x,y,z] / [lx,ly,lz]"
+                        )
+                    if min(size_t) <= 0:
+                        raise ValueError(
+                            f"terrain_boxes[{name!r}]: size entries must be positive (full dimensions in meters)"
+                        )
+                    rgba_ = spec.get("rgba")
+                    if rgba_ is not None:
+                        rgba_t = tuple(float(x) for x in rgba_)
+                        if len(rgba_t) != 4:
+                            raise ValueError(
+                                f"terrain_boxes[{name!r}]: rgba must be length-4 [r,g,b,a]"
+                            )
+                    else:
+                        rgba_t = None
+                    boxes.append((str(name), pos_t, size_t, rgba_t))
+            else:
+                for i, spec in enumerate(terrain_boxes_cfg):
+                    if not isinstance(spec, dict):
+                        raise TypeError(f"terrain_boxes[{i}] must be a dict with pos, size, ...")
+                    pos_ = spec.get("pos")
+                    size_ = spec.get("size")
+                    if pos_ is None or size_ is None:
+                        raise ValueError(
+                            f"terrain_boxes[{i}] must include pos and size (length-3 each)"
+                        )
+                    pos_t = tuple(float(x) for x in pos_)
+                    size_t = tuple(float(x) for x in size_)
+                    if len(pos_t) != 3 or len(size_t) != 3:
+                        raise ValueError(
+                            f"terrain_boxes[{i}]: pos and size must be length-3 [x,y,z] / [lx,ly,lz]"
+                        )
+                    if min(size_t) <= 0:
+                        raise ValueError(
+                            f"terrain_boxes[{i}]: size entries must be positive (full dimensions in meters)"
+                        )
+                    rgba_ = spec.get("rgba")
+                    if rgba_ is not None:
+                        rgba_t = tuple(float(x) for x in rgba_)
+                        if len(rgba_t) != 4:
+                            raise ValueError(
+                                f"terrain_boxes[{i}]: rgba must be length-4 [r,g,b,a]"
+                            )
+                    else:
+                        rgba_t = None
+                    name = spec.get("name", f"box_{i}")
+                    boxes.append((str(name), pos_t, size_t, rgba_t))
+
+            scene_xml = merge_terrain_boxes_into_scene_xml(scene_xml, boxes, default_rgba=default_rgba)
+            scene_dirty = True
+            print(
+                f"[MujocoRobot] Procedural terrain boxes: {len(boxes)} (terrain_boxes)",
+                flush=True,
+            )
+
+        elif has_terrain_box_legacy:
             from utils.urdf_to_mujoco import merge_terrain_box_into_scene_xml
 
             pos_t = tuple(float(x) for x in tb_pos)
@@ -527,14 +623,27 @@ class MujocoRobot:
                 use_columns_for_collision = False
             else:
                 use_columns_for_collision = config.get("terrain_use_columns", True)
+            tuo = config.get("terrain_urdf_offset")
+            if tuo is not None:
+                terrain_urdf_offset = tuple(float(x) for x in tuo)
+                if len(terrain_urdf_offset) != 3:
+                    raise ValueError("terrain_urdf_offset must be length-3 [x, y, z] (m)")
+            else:
+                terrain_urdf_offset = (0.0, 0.0, 0.0)
             scene_xml = merge_terrain_into_scene_from_string(
                 scene_xml,
                 terrain_path,
                 use_columns_for_collision=use_columns_for_collision,
                 terrain_column_res=config.get("terrain_column_res", 0.2),
                 terrain_floor_threshold=config.get("terrain_floor_threshold", 0.02),
+                terrain_urdf_offset=terrain_urdf_offset,
             )
             scene_dirty = True
+            if terrain_urdf_offset != (0.0, 0.0, 0.0):
+                print(
+                    f"[MujocoRobot] terrain_urdf_offset world (m)={terrain_urdf_offset}",
+                    flush=True,
+                )
 
         if scene_dirty:
             fd, self._terrain_temp_file = tempfile.mkstemp(
@@ -567,7 +676,7 @@ class MujocoRobot:
                     f"  Check that the URDF and mesh file exist and are valid."
                 )
             if has_terrain_box:
-                msg += "  Check terrain_box_pos / terrain_box_size and scene XML.\n"
+                msg += "  Check terrain_box_pos / terrain_box_size or terrain_boxes and scene XML.\n"
             if has_free_box:
                 msg += "  Check free_box_pos / free_box_size / free_box_mass and scene XML.\n"
             raise RuntimeError(msg) from e

@@ -8,15 +8,20 @@ single mesh collision geom is used (controller config: terrain_mesh_collision: t
 
 Note: MuJoCo mesh collision still uses a convex hull per mesh geom (not the column decomposition).
 
-Procedural box terrain (no URDF): mujoco_env reads config keys terrain_box_pos, terrain_box_size
-(full dimensions); see merge_terrain_box_into_scene_xml.
+Procedural box terrain (no URDF): use ``terrain_box_pos`` / ``terrain_box_size`` (single box) or
+``terrain_boxes`` — a dict (name -> {pos, size, rgba?}) or a list of {pos, size, rgba?, name?};
+see merge_terrain_box_into_scene_xml and merge_terrain_boxes_into_scene_xml.
+
+URDF terrain position in world: config key terrain_urdf_offset [x, y, z] (m) wraps merged terrain
+bodies in a static parent body; see merge_terrain_into_scene_from_string.
 Dynamic free box (no URDF): mujoco_env reads config keys free_box_pos, free_box_size, free_box_mass;
 see merge_free_box_into_scene_xml.
 """
 import os
+import re
 import xml.etree.ElementTree as ET
 import numpy as np
-from typing import Tuple, List
+from typing import List, Optional, Tuple
 
 
 def _load_obj_vertices(obj_path: str, scale: Tuple[float, float, float] = (1, 1, 1)) -> np.ndarray:
@@ -388,6 +393,21 @@ def merge_object_into_scene(scene_xml: str, object_urdf_path: str) -> str:
     return scene_xml
 
 
+def _wrap_terrain_urdf_bodies_with_offset(
+    body_xml: str, offset: Tuple[float, float, float]
+) -> str:
+    """Wrap terrain link bodies in a static parent with world translation (m)."""
+    ox, oy, oz = float(offset[0]), float(offset[1]), float(offset[2])
+    if not body_xml.strip():
+        return body_xml
+    inner = "\n".join("  " + line if line.strip() else line for line in body_xml.splitlines())
+    return (
+        f'    <body name="terrain_urdf_root" pos="{ox} {oy} {oz}" quat="1 0 0 0">\n'
+        f"{inner}\n"
+        f"    </body>"
+    )
+
+
 def _insert_after_worldbody_open(scene_xml: str, body_fragment: str) -> str:
     """Insert a worldbody child right after <worldbody> ... newline (same as terrain insert)."""
     worldbody_start = scene_xml.find("<worldbody>")
@@ -397,6 +417,78 @@ def _insert_after_worldbody_open(scene_xml: str, body_fragment: str) -> str:
     while insert_pos < len(scene_xml) and scene_xml[insert_pos] in " \t\n":
         insert_pos += 1
     return scene_xml[:insert_pos] + "\n" + body_fragment + "\n    " + scene_xml[insert_pos:]
+
+
+def _sanitize_terrain_box_body_name(label: str) -> str:
+    """MuJoCo body name: alphanumeric + underscore; prefix if needed."""
+    s = re.sub(r"[^0-9a-zA-Z_]", "_", str(label).strip())
+    s = re.sub(r"_+", "_", s).strip("_")
+    if not s:
+        s = "box"
+    if s[0].isdigit():
+        s = "b_" + s
+    return s
+
+
+def terrain_box_body_xml_fragment(
+    pos_xyz: Tuple[float, float, float],
+    size_xyz: Tuple[float, float, float],
+    rgba: Tuple[float, float, float, float] = (0.55, 0.52, 0.48, 1.0),
+    body_name: str = "terrain_box",
+) -> str:
+    """
+    One static axis-aligned box body/geom (indentation for worldbody child). ``body_name`` must be
+    unique in the model; geom is named ``{body_name}_geom``.
+    """
+    bname = _sanitize_terrain_box_body_name(body_name)
+    hx = float(size_xyz[0]) / 2.0
+    hy = float(size_xyz[1]) / 2.0
+    hz = float(size_xyz[2]) / 2.0
+    px, py, pz = float(pos_xyz[0]), float(pos_xyz[1]), float(pos_xyz[2])
+    r, g, b, a = float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3])
+    return (
+        f'    <body name="{bname}" pos="{px} {py} {pz}" quat="1 0 0 0">\n'
+        f'      <geom name="{bname}_geom" type="box" pos="0 0 0" size="{hx} {hy} {hz}" '
+        f'contype="1" conaffinity="1" rgba="{r} {g} {b} {a}"/>\n'
+        f"    </body>"
+    )
+
+
+def merge_terrain_boxes_into_scene_xml(
+    scene_xml: str,
+    boxes: List[
+        Tuple[
+            str,
+            Tuple[float, float, float],
+            Tuple[float, float, float],
+            Optional[Tuple[float, float, float, float]],
+        ]
+    ],
+    default_rgba: Tuple[float, float, float, float] = (0.55, 0.52, 0.48, 1.0),
+) -> str:
+    """
+    Insert several static box bodies (one fragment, order preserved: first in ``boxes`` is first
+    in worldbody after ``<worldbody>``).
+
+    Each tuple is (label_for_body_name, pos_xyz, size_xyz, rgba_or_none). Body names are
+    sanitized; geom names are ``{body}_geom``.
+
+    If ``boxes`` is empty, returns ``scene_xml`` unchanged.
+    """
+    if not boxes:
+        return scene_xml
+    parts: List[str] = []
+    used: set = set()
+    for label, pos_xyz, size_xyz, rgba in boxes:
+        bname = _sanitize_terrain_box_body_name(label)
+        if bname in used:
+            raise ValueError(f"Duplicate terrain box body name after sanitize: {bname!r} (from {label!r})")
+        used.add(bname)
+        rgba_t = default_rgba if rgba is None else rgba
+        if len(rgba_t) != 4:
+            raise ValueError("each terrain box rgba must be length-4 [r,g,b,a]")
+        parts.append(terrain_box_body_xml_fragment(pos_xyz, size_xyz, rgba_t, body_name=label))
+    return _insert_after_worldbody_open(scene_xml, "\n".join(parts))
 
 
 def merge_terrain_box_into_scene_xml(
@@ -413,20 +505,11 @@ def merge_terrain_box_into_scene_xml(
         size_xyz: Full outer dimensions (lx, ly, lz) in meters; converted to MuJoCo half-sizes.
         rgba: Visual/collision rgba (alpha only affects visualization).
 
-    The body is named ``terrain_box``; geom ``terrain_box_geom``.
+    The body is named ``terrain_box``; geom ``terrain_box_geom`` (see terrain_box_body_xml_fragment).
     """
-    hx = float(size_xyz[0]) / 2.0
-    hy = float(size_xyz[1]) / 2.0
-    hz = float(size_xyz[2]) / 2.0
-    px, py, pz = float(pos_xyz[0]), float(pos_xyz[1]), float(pos_xyz[2])
-    r, g, b, a = float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3])
-    body_xml = (
-        f'    <body name="terrain_box" pos="{px} {py} {pz}" quat="1 0 0 0">\n'
-        f'      <geom name="terrain_box_geom" type="box" pos="0 0 0" size="{hx} {hy} {hz}" '
-        f'contype="1" conaffinity="1" rgba="{r} {g} {b} {a}"/>\n'
-        f"    </body>"
+    return merge_terrain_boxes_into_scene_xml(
+        scene_xml, [("terrain_box", pos_xyz, size_xyz, rgba)]
     )
-    return _insert_after_worldbody_open(scene_xml, body_xml)
 
 
 def merge_free_box_into_scene_xml(
@@ -469,9 +552,12 @@ def merge_terrain_into_scene_from_string(
     use_columns_for_collision: bool = True,
     terrain_column_res: float = 0.2,
     terrain_floor_threshold: float = 0.02,
+    terrain_urdf_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> str:
     """
     Merge terrain URDF into an in-memory MJCF string (same as merge_terrain_into_scene, no file read).
+
+    terrain_urdf_offset: world-frame translation (m) applied to all merged terrain bodies (parent body).
     """
     mesh_xml, body_xml = urdf_to_mujoco_xml(
         terrain_urdf_path,
@@ -481,6 +567,10 @@ def merge_terrain_into_scene_from_string(
     )
     if not mesh_xml or not body_xml:
         return scene_xml
+
+    ox, oy, oz = float(terrain_urdf_offset[0]), float(terrain_urdf_offset[1]), float(terrain_urdf_offset[2])
+    if abs(ox) > 0.0 or abs(oy) > 0.0 or abs(oz) > 0.0:
+        body_xml = _wrap_terrain_urdf_bodies_with_offset(body_xml, (ox, oy, oz))
 
     if "<asset>" in scene_xml and "</asset>" in scene_xml:
         scene_xml = scene_xml.replace("</asset>", "\n" + mesh_xml + "\n  </asset>")
@@ -505,6 +595,7 @@ def merge_terrain_into_scene(
     use_columns_for_collision: bool = True,
     terrain_column_res: float = 0.2,
     terrain_floor_threshold: float = 0.02,
+    terrain_urdf_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> str:
     """
     Merge terrain from URDF into a MuJoCo scene XML.
@@ -519,6 +610,7 @@ def merge_terrain_into_scene(
         use_columns_for_collision=use_columns_for_collision,
         terrain_column_res=terrain_column_res,
         terrain_floor_threshold=terrain_floor_threshold,
+        terrain_urdf_offset=terrain_urdf_offset,
     )
     if output_path:
         with open(output_path, "w") as f:

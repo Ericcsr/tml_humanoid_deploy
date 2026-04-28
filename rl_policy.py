@@ -21,6 +21,72 @@ import numpy.core.multiarray as multiarray
 sys.modules['numpy._core.multiarray'] = multiarray
 
 
+def expand_4way_contact_to_8(m4: np.ndarray) -> np.ndarray:
+    """
+    4-way [Lfoot, Rfoot, Lwrist, Rwrist] -> 8-way
+    [Lfoot_env, Lfoot_obj, Rfoot_env, Rfoot_obj, Lwrist_env, Lwrist_obj, Rwrist_env, Rwrist_obj]
+    Default split: foot values -> env; wrist values -> object; the paired channel is 0.
+    """
+    m4 = np.asarray(m4, dtype=np.float32)
+    lead = m4.ndim - 1
+    if m4.shape[lead] != 4:
+        raise ValueError(f"expand_4way_contact_to_8: expected 4 contact channels, got {m4.shape[lead]}")
+    sl = (slice(None),) * lead
+    m8 = np.zeros(m4.shape[:lead] + (8,), dtype=np.float32)
+    m8[sl + (0,)] = m4[sl + (0,)]
+    m8[sl + (2,)] = m4[sl + (1,)]
+    m8[sl + (5,)] = m4[sl + (2,)]
+    m8[sl + (7,)] = m4[sl + (3,)]
+    return m8
+
+
+def reduce_8way_contact_to_4(m8: np.ndarray) -> np.ndarray:
+    """
+    8-way -> 4-way by max(env, obj) per limb (Lfoot, Rfoot, Lwrist, Rwrist).
+    """
+    m8 = np.asarray(m8, dtype=np.float32)
+    lead = m8.ndim - 1
+    if m8.shape[lead] != 8:
+        raise ValueError(f"reduce_8way_contact_to_4: expected 8 contact channels, got {m8.shape[lead]}")
+    sl = (slice(None),) * lead
+    m4 = np.empty(m8.shape[:lead] + (4,), dtype=np.float32)
+    m4[sl + (0,)] = np.maximum(m8[sl + (0,)], m8[sl + (1,)])
+    m4[sl + (1,)] = np.maximum(m8[sl + (2,)], m8[sl + (3,)])
+    m4[sl + (2,)] = np.maximum(m8[sl + (4,)], m8[sl + (5,)])
+    m4[sl + (3,)] = np.maximum(m8[sl + (6,)], m8[sl + (7,)])
+    return m4
+
+
+def normalize_contact_mask_labels(
+    raw: np.ndarray,
+    *,
+    use_8way_contact: bool,
+) -> np.ndarray:
+    """
+    Load (T,4) or (T,8) to match deploy mode: 4-way policy vs 8-way.
+    4+8 mix: 4 with use_8way -> expand; 8 without use_8way -> max-pool to 4.
+    """
+    raw = np.asarray(raw, dtype=np.float32)
+    if raw.ndim != 2:
+        raise ValueError(f"contact_mask must be 2D (T, C), got shape {raw.shape}")
+    c = raw.shape[1]
+    if use_8way_contact:
+        if c == 8:
+            return raw
+        if c == 4:
+            return expand_4way_contact_to_8(raw)
+        raise ValueError(
+            f"contact_mask: use_8way_contact is True, expected 4 or 8 columns, got {c}"
+        )
+    if c == 4:
+        return raw
+    if c == 8:
+        return reduce_8way_contact_to_4(raw)
+    raise ValueError(
+        f"contact_mask: use_8way_contact is False, expected 4 or 8 columns, got {c}"
+    )
+
+
 def _compute_initial_vr_3point_local_from_pybullet(
     default_q_isaac,
     urdf_path,
@@ -517,7 +583,20 @@ class RLGlobalCHIPPolicy(RLCHIPPolicy):
 
 
 class RLContactPolicy(RLBasePolicy):
-    def __init__(self, onnx_model_path, obs_names, ref_motion_path, contact_labels_path, lookahead_steps=1, lookahead_frame_skips=1, hist_names=[], hist_length=10, init_at_first_frame=False):
+    def __init__(
+        self,
+        onnx_model_path,
+        obs_names,
+        ref_motion_path,
+        contact_labels_path,
+        lookahead_steps=1,
+        lookahead_frame_skips=1,
+        hist_names=[],
+        hist_length=10,
+        init_at_first_frame=False,
+        zero_foot_contact_on_load=False,
+        use_8way_contact=False,
+    ):
         super().__init__(onnx_model_path, obs_names)
         self.default_value = {
             "q": np.array([float(x) for x in self.meta_data["default_joint_pos"].split(",")]),
@@ -530,14 +609,47 @@ class RLContactPolicy(RLBasePolicy):
             self.action_scale = self.action_scale[ISAAC_TO_MUJOCO]
 
         self.lower_joint_indices = ISAAC_TO_MUJOCO[:12]
-        
+        self.use_8way_contact = use_8way_contact
+        self.contact_dim = 8 if use_8way_contact else 4
+
         self.ref_motion = np.load(ref_motion_path)
+        tlen = int(self.ref_motion["joint_pos"].shape[0])
         if contact_labels_path != "default":
             self.contact_labels = np.load(contact_labels_path, allow_pickle=True).item()
             self.contact_mask = self.contact_labels["contact_mask"].astype(np.float32)
-            #self.contact_mask[28:,2:] = 1
+            if self.contact_mask.ndim != 2:
+                raise ValueError(
+                    f"contact_mask must be 2D (T, C), got shape {self.contact_mask.shape}"
+                )
+            tm, tc = self.contact_mask.shape[0], self.contact_mask.shape[1]
+            if tc not in (4, 8):
+                raise ValueError(
+                    f"contact_mask: expected 4 or 8 columns, got {tc} (T={tm})"
+                )
+            if tm < tlen:
+                pad = np.zeros((tlen - tm, tc), dtype=np.float32)
+                self.contact_mask = np.vstack([self.contact_mask, pad])
+            elif tm > tlen:
+                self.contact_mask = self.contact_mask[:tlen]
+            self.contact_mask = normalize_contact_mask_labels(
+                self.contact_mask, use_8way_contact=use_8way_contact
+            )
+            if zero_foot_contact_on_load and self.contact_mask.ndim == 2:
+                self.contact_mask = self.contact_mask.copy()
+                if use_8way_contact and self.contact_mask.shape[1] >= 4:
+                    self.contact_mask[:, 0:4] = 0.0
+                elif (not use_8way_contact) and self.contact_mask.shape[1] >= 2:
+                    self.contact_mask[:, :2] = 0.0
+                print(
+                    "[RLContactPolicy] zero_foot_contact_on_load: foot contact channels set to 0",
+                    flush=True,
+                )
         else:
-            self.contact_mask = np.zeros((self.ref_motion["joint_pos"].shape[0], 4))
+            self.contact_mask = np.zeros((tlen, self.contact_dim), dtype=np.float32)
+        print(
+            f"[RLContactPolicy] contact_mask (T, C)={self.contact_mask.shape} use_8way_contact={use_8way_contact}",
+            flush=True,
+        )
         self.init_at_first_frame = init_at_first_frame
         if init_at_first_frame:
             # No recentering: use world frame (robot already at first frame on terrain)
@@ -659,6 +771,8 @@ class RLStreamingContactPolicy(RLBasePolicy):
         redis_ip=REDIS_IP,
         redis_port=REDIS_PORT,
         redis_channels=None,
+        default_contact_label=None,
+        use_8way_contact=False,
     ):
         super().__init__(onnx_model_path, obs_names)
         self.default_value = {
@@ -671,12 +785,13 @@ class RLStreamingContactPolicy(RLBasePolicy):
         else:
             self.action_scale = self.action_scale[ISAAC_TO_MUJOCO]
 
+        self.use_8way_contact = use_8way_contact
+        self.contact_dim = 8 if use_8way_contact else 4
         self.motion_length = int(1e9)
         self.keyboard_controller = KeyboardController()
         self.lower_cmd_dim = 24 * lookahead_steps
         self.vr_pos_dim = 9
         self.vr_orn_dim = 12
-        self.contact_dim = 4
         self.anchor_pos_dim = 3
         self.anchor_orn_dim = 4
 
@@ -711,7 +826,15 @@ class RLStreamingContactPolicy(RLBasePolicy):
             self.latest_vr_3point_orn[4] = 1.0
             self.latest_vr_3point_orn[8] = 1.0
 
-        self.latest_contact_mask = np.zeros(self.contact_dim, dtype=np.float32)
+        if default_contact_label is None:
+            self.latest_contact_mask = np.zeros(self.contact_dim, dtype=np.float32)
+        else:
+            parsed_default_contact = np.asarray(default_contact_label, dtype=np.float32).reshape(-1)
+            if parsed_default_contact.size != self.contact_dim:
+                raise ValueError(
+                    f"default_contact_label must contain {self.contact_dim} values, got {parsed_default_contact.size}"
+                )
+            self.latest_contact_mask = parsed_default_contact.copy()
         self.latest_motion_anchor_pos_w = np.zeros(self.anchor_pos_dim, dtype=np.float32)
         self.latest_motion_anchor_orn_w = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)  # xyzw
         self.received_any_stream = False
@@ -751,7 +874,7 @@ class RLStreamingContactPolicy(RLBasePolicy):
             self.redis_channels["motion_anchor_orn_w"]: "motion_anchor_orn_w",
         }
         print(
-            f"[RLStreamingContactPolicy] Listening Redis channels:"
+            f"[RLStreamingContactPolicy] contact_dim={self.contact_dim} use_8way_contact={use_8way_contact} — Listening Redis channels:"
             f" {self.redis_channels['lower_cmd']}, {self.redis_channels['vr_3point_pos_l']},"
             f" {self.redis_channels['vr_3point_orn_l']}, {self.redis_channels['contact_mask']},"
             f" {self.redis_channels['motion_anchor_pos_w']}, {self.redis_channels['motion_anchor_orn_w']}"
@@ -833,6 +956,7 @@ class RLStreamingContactPolicy(RLBasePolicy):
             "motion_anchor_ori_b": (anchor_rot_inv * target_anchor_rot).as_matrix()[:, :2].reshape(-1).astype(np.float32),
         }
         control_signals["projected_gravity"] = anchor_rot_inv.apply(np.array([0, 0, -1]))
+        print(control_signals["contact_mask"])
         return control_signals
 
     def prepare_obs(self, robot_state, control_signals):

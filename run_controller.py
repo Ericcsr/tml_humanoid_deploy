@@ -226,7 +226,15 @@ if __name__ == "__main__":
     terrain_urdf = str(terrain_urdf).strip() if terrain_urdf else ""
     terrain_box_pos = config.get("terrain_box_pos")
     terrain_box_size = config.get("terrain_box_size")
-    has_terrain_box = terrain_box_pos is not None and terrain_box_size is not None
+    has_terrain_box_legacy = terrain_box_pos is not None and terrain_box_size is not None
+    tbc = config.get("terrain_boxes")
+    if isinstance(tbc, dict):
+        has_terrain_box_multi = len(tbc) > 0
+    elif isinstance(tbc, list):
+        has_terrain_box_multi = len(tbc) > 0
+    else:
+        has_terrain_box_multi = False
+    has_terrain_box = has_terrain_box_legacy or has_terrain_box_multi
     object_urdf = config.get("object_urdf") or ""
     object_urdf = str(object_urdf).strip() if object_urdf else ""
     object_motion = config.get("object_motion") or ""
@@ -284,7 +292,7 @@ if __name__ == "__main__":
                                 lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
                                 hist_names=config.get("history_names", []), hist_length=config.get("history_length", 1),
                                 init_at_first_frame=init_at_first_frame)                    
-    elif config.get("use_streaming_contact", False):
+    elif config.get("use_streaming_motion", False):
         policy = RLStreamingContactPolicy(
             config["onnx_model_path"],
             config["obs_names"],
@@ -295,12 +303,23 @@ if __name__ == "__main__":
             redis_ip=config.get("streaming_redis_ip", REDIS_IP),
             redis_port=config.get("streaming_redis_port", REDIS_PORT),
             redis_channels=config.get("streaming_channels", None),
+            default_contact_label=config.get("default_contact_label", None),
+            use_8way_contact=config.get("use_8way_contact", False),
         )
     elif config.get("use_contact", False):
-        policy = RLContactPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], config["contact_labels_path"], 
-                            lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
-                            hist_names=config.get("history_names", []), hist_length=config.get("history_length", 1),
-                            init_at_first_frame=init_at_first_frame)
+        policy = RLContactPolicy(
+            config["onnx_model_path"],
+            config["obs_names"],
+            config["ref_motion_path"],
+            config["contact_labels_path"],
+            lookahead_steps=lookahead_steps,
+            lookahead_frame_skips=lookahead_frame_skips,
+            hist_names=config.get("history_names", []),
+            hist_length=config.get("history_length", 1),
+            init_at_first_frame=init_at_first_frame,
+            zero_foot_contact_on_load=config.get("zero_foot_contact_on_load", False),
+            use_8way_contact=config.get("use_8way_contact", False),
+        )
     else:
         policy = RLBMPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
                             lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
