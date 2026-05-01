@@ -304,6 +304,7 @@ if __name__ == "__main__":
             redis_channels=config.get("streaming_channels", None),
             default_contact_label=config.get("default_contact_label", None),
             use_8way_contact=config.get("use_8way_contact", False),
+            use_10way_contact=config.get("use_10way_contact", False),
         )
     elif config.get("use_contact", False):
         policy = RLContactPolicy(
@@ -318,6 +319,7 @@ if __name__ == "__main__":
             init_at_first_frame=init_at_first_frame,
             zero_foot_contact_on_load=config.get("zero_foot_contact_on_load", False),
             use_8way_contact=config.get("use_8way_contact", False),
+            use_10way_contact=config.get("use_10way_contact", False),
         )
     else:
         policy = RLBMPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
