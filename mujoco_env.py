@@ -482,6 +482,19 @@ class MujocoRobot:
         if has_terrain_box_multi:
             from utils.urdf_to_mujoco import merge_terrain_boxes_into_scene_xml
 
+            def _terrain_yaw_from_spec(spec: dict, ctx: str) -> float:
+                import math
+
+                has_yaw = "yaw" in spec
+                has_yaw_deg = "yaw_deg" in spec
+                if has_yaw and has_yaw_deg:
+                    raise ValueError(f"{ctx}: use only one of yaw (radians) or yaw_deg")
+                if has_yaw_deg:
+                    return math.radians(float(spec["yaw_deg"]))
+                if has_yaw:
+                    return float(spec["yaw"])
+                return 0.0
+
             default_rgba = (0.55, 0.52, 0.48, 1.0)
             boxes: list = []
             if isinstance(terrain_boxes_cfg, dict):
@@ -513,7 +526,8 @@ class MujocoRobot:
                             )
                     else:
                         rgba_t = None
-                    boxes.append((str(name), pos_t, size_t, rgba_t))
+                    yaw_t = _terrain_yaw_from_spec(spec, f"terrain_boxes[{name!r}]")
+                    boxes.append((str(name), pos_t, size_t, rgba_t, yaw_t))
             else:
                 for i, spec in enumerate(terrain_boxes_cfg):
                     if not isinstance(spec, dict):
@@ -544,7 +558,8 @@ class MujocoRobot:
                     else:
                         rgba_t = None
                     name = spec.get("name", f"box_{i}")
-                    boxes.append((str(name), pos_t, size_t, rgba_t))
+                    yaw_t = _terrain_yaw_from_spec(spec, f"terrain_boxes[{i}]")
+                    boxes.append((str(name), pos_t, size_t, rgba_t, yaw_t))
 
             scene_xml = merge_terrain_boxes_into_scene_xml(scene_xml, boxes, default_rgba=default_rgba)
             scene_dirty = True
@@ -555,6 +570,7 @@ class MujocoRobot:
 
         elif has_terrain_box_legacy:
             from utils.urdf_to_mujoco import merge_terrain_box_into_scene_xml
+            import math
 
             pos_t = tuple(float(x) for x in tb_pos)
             size_t = tuple(float(x) for x in tb_size)
@@ -564,14 +580,22 @@ class MujocoRobot:
                 )
             if min(size_t) <= 0:
                 raise ValueError("terrain_box_size entries must be positive (full dimensions in meters)")
+            if "terrain_box_yaw" in config and "terrain_box_yaw_deg" in config:
+                raise ValueError("Use only one of terrain_box_yaw (rad) or terrain_box_yaw_deg")
+            if "terrain_box_yaw_deg" in config:
+                yaw_t = math.radians(float(config["terrain_box_yaw_deg"]))
+            elif "terrain_box_yaw" in config:
+                yaw_t = float(config["terrain_box_yaw"])
+            else:
+                yaw_t = 0.0
             tb_rgba = config.get("terrain_box_rgba")
             if tb_rgba is not None:
                 rgba_t = tuple(float(x) for x in tb_rgba)
                 if len(rgba_t) != 4:
                     raise ValueError("terrain_box_rgba must be length-4 [r,g,b,a]")
-                scene_xml = merge_terrain_box_into_scene_xml(scene_xml, pos_t, size_t, rgba_t)
+                scene_xml = merge_terrain_box_into_scene_xml(scene_xml, pos_t, size_t, rgba_t, yaw_t)
             else:
-                scene_xml = merge_terrain_box_into_scene_xml(scene_xml, pos_t, size_t)
+                scene_xml = merge_terrain_box_into_scene_xml(scene_xml, pos_t, size_t, yaw_rad=yaw_t)
             scene_dirty = True
             print(
                 f"[MujocoRobot] Procedural terrain box center={pos_t} full_size={size_t} (m)",

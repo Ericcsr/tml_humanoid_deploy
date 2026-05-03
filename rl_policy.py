@@ -21,6 +21,18 @@ import numpy.core.multiarray as multiarray
 sys.modules['numpy._core.multiarray'] = multiarray
 
 
+def clamp_ref_motion_start_index(start: int, motion_length: int) -> int:
+    """Clamp start frame index to [0, motion_length - 1]."""
+    if motion_length <= 0:
+        return 0
+    s = int(start)
+    if s < 0:
+        return 0
+    if s >= motion_length:
+        return motion_length - 1
+    return s
+
+
 def expand_4way_contact_to_8(m4: np.ndarray) -> np.ndarray:
     """
     4-way [Lfoot, Rfoot, Lwrist, Rwrist] -> 8-way
@@ -59,6 +71,24 @@ def expand_5way_contact_to_10(m5: np.ndarray) -> np.ndarray:
     m10[sl + (8,)] = seat
     m10[sl + (9,)] = np.float32(0.0)
     return m10
+
+
+def pad_4way_contact_to_5(m4: np.ndarray) -> np.ndarray:
+    """Append a zero column: (..., 4) -> (..., 5) for pelvis/seat channel (unused when sourcing 4-way data)."""
+    m4 = np.asarray(m4, dtype=np.float32)
+    lead = m4.ndim - 1
+    if m4.shape[lead] != 4:
+        raise ValueError(f"pad_4way_contact_to_5: expected 4 contact channels, got {m4.shape[lead]}")
+    z = np.zeros(m4.shape[:lead] + (1,), dtype=np.float32)
+    return np.concatenate([m4, z], axis=lead)
+
+
+def expand_4way_limb_to_10way_with_zero_seat(m4: np.ndarray) -> np.ndarray:
+    """(..., 4) 4-way limbs -> (..., 10): 8-way limb channels + [0, 0] pelvis/seat (2-way)."""
+    m8 = expand_4way_contact_to_8(np.asarray(m4, dtype=np.float32))
+    lead = m8.ndim - 1
+    z2 = np.zeros(m8.shape[:lead] + (2,), dtype=np.float32)
+    return np.concatenate([m8, z2], axis=lead)
 
 
 def reduce_8way_contact_to_4(m8: np.ndarray) -> np.ndarray:
@@ -247,7 +277,16 @@ class RLBasePolicy:
 
 
 class RLBMPolicy(RLBasePolicy):
-    def __init__(self, onnx_model_path, obs_names, ref_motion_path, lookahead_steps=1, lookahead_frame_skips=1, init_at_first_frame=False):
+    def __init__(
+        self,
+        onnx_model_path,
+        obs_names,
+        ref_motion_path,
+        lookahead_steps=1,
+        lookahead_frame_skips=1,
+        init_at_first_frame=False,
+        ref_motion_start_index=0,
+    ):
         super().__init__(onnx_model_path, obs_names)
         
 
@@ -262,14 +301,17 @@ class RLBMPolicy(RLBasePolicy):
             self.action_scale = self.action_scale[ISAAC_TO_MUJOCO]
         
         self.ref_motion = np.load(ref_motion_path)
+        self.motion_length = self.ref_motion["joint_pos"].shape[0]
+        self.ref_motion_start_index = clamp_ref_motion_start_index(ref_motion_start_index, self.motion_length)
+        self.ticker = self.ref_motion_start_index
         if init_at_first_frame:
             self.init_root_pos = np.zeros(3)
             self.init_root_heading_inv = Rotation.identity()
         else:
-            self.init_root_pos = self.ref_motion["body_pos_w"][0,0].copy()
+            si = self.ref_motion_start_index
+            self.init_root_pos = self.ref_motion["body_pos_w"][si, 0].copy()
             self.init_root_pos[2] = 0  # set initial height to 0 (flat ground)
-            self.init_root_heading_inv = Rotation.from_quat(yaw_quat(self.ref_motion["body_quat_w"][0,0])[[1,2,3,0]]).inv()
-        self.motion_length = self.ref_motion["joint_pos"].shape[0]
+            self.init_root_heading_inv = Rotation.from_quat(yaw_quat(self.ref_motion["body_quat_w"][si, 0])[[1,2,3,0]]).inv()
         self.ref_q_pos = self.ref_motion["joint_pos"].copy()
         self.ref_q_vel = self.ref_motion["joint_vel"].copy()
         self.ref_anchor_poses = self.ref_motion["body_pos_w"][:,0].copy()
@@ -282,7 +324,8 @@ class RLBMPolicy(RLBasePolicy):
     
 
     def get_q_init(self):
-        return self.ref_motion["joint_pos"][0, ISAAC_TO_MUJOCO]
+        si = self.ref_motion_start_index
+        return self.ref_motion["joint_pos"][si, ISAAC_TO_MUJOCO]
 
     def _control_signals_from_motion(self):
         mid = self.ticker if self.ticker < self.motion_length else self.motion_length-1
@@ -336,12 +379,21 @@ class RLBMPolicy(RLBasePolicy):
         ort_outs = self.session.run(None, ort_inputs)
         if start_ticker:
             self.ticker += 1
-        elif self.ticker > 0:
-            self.ticker = 0
+        elif self.ticker > self.ref_motion_start_index:
+            self.ticker = self.ref_motion_start_index
         return ort_outs[0].flatten()
     
 class RL3ptPolicy(RLBasePolicy):
-    def __init__(self, onnx_model_path, obs_names, ref_motion_path, lookahead_steps=1, lookahead_frame_skips=1, init_at_first_frame=False):
+    def __init__(
+        self,
+        onnx_model_path,
+        obs_names,
+        ref_motion_path,
+        lookahead_steps=1,
+        lookahead_frame_skips=1,
+        init_at_first_frame=False,
+        ref_motion_start_index=0,
+    ):
         super().__init__(onnx_model_path, obs_names)
         self.ref_motion = np.load(ref_motion_path)
 
@@ -356,17 +408,22 @@ class RL3ptPolicy(RLBasePolicy):
             self.action_scale = self.action_scale[ISAAC_TO_MUJOCO]
 
         self.lower_joint_indices = ISAAC_TO_MUJOCO[:12]
-        
+        self.motion_length = self.ref_motion["joint_pos"].shape[0]
+        self.ref_motion_start_index = clamp_ref_motion_start_index(ref_motion_start_index, self.motion_length)
+        self.ticker = self.ref_motion_start_index
+
         if init_at_first_frame:
             self.init_root_pos = np.zeros(3)
             self.init_root_heading_inv = Rotation.identity()
         else:
-            self.init_root_pos = self.ref_motion["body_pos_w"][0,0].copy()
+            si = self.ref_motion_start_index
+            self.init_root_pos = self.ref_motion["body_pos_w"][si, 0].copy()
             self.init_root_pos[2] = 0  # set initial height to 0 (flat ground)
-            self.init_root_heading_inv = Rotation.from_quat(yaw_quat(self.ref_motion["body_quat_w"][0,0])[[1,2,3,0]]).inv()
+            self.init_root_heading_inv = Rotation.from_quat(
+                yaw_quat(self.ref_motion["body_quat_w"][si, 0])[[1, 2, 3, 0]]
+            ).inv()
         self.vr_3point_indices = [28,29,9] # by calling self.robot.find_bodies(["left_wrist_yaw_link",""right_wrist_yaw_link","torso_link"])
         self.ref_vr_3point_offsets = np.array([[0.18, -0.025, 0.0], [0.18,0.025, 0.0], [0.0,0.0,0.35]])  # relative to anchor point
-        self.motion_length = self.ref_motion["joint_pos"].shape[0]
         self.ref_q_pos = self.ref_motion["joint_pos"].copy()
         self.ref_q_vel = self.ref_motion["joint_vel"].copy()
         self.ref_anchor_poses = self.ref_motion["body_pos_w"][:,0].copy()
@@ -386,7 +443,8 @@ class RL3ptPolicy(RLBasePolicy):
     
 
     def get_q_init(self):
-        return self.ref_motion["joint_pos"][0, ISAAC_TO_MUJOCO]
+        si = self.ref_motion_start_index
+        return self.ref_motion["joint_pos"][si, ISAAC_TO_MUJOCO]
 
     def _control_signals_from_motion(self):
         mid = self.ticker if self.ticker < self.motion_length else self.motion_length-1
@@ -443,8 +501,8 @@ class RL3ptPolicy(RLBasePolicy):
         ort_outs = self.session.run(None, ort_inputs)
         if start_ticker:
             self.ticker += 1
-        elif self.ticker > 0:
-            self.ticker = 0
+        elif self.ticker > self.ref_motion_start_index:
+            self.ticker = self.ref_motion_start_index
         return ort_outs[0].flatten()
     
 
@@ -457,7 +515,18 @@ class RLCHIPPolicy(RLBasePolicy):
        0.351, 0.351, 0.439, 0.439, 0.439, 0.439, 0.439, 0.439, 0.439,
        0.439, 0.439, 0.439, 0.439, 0.439, 0.439, 0.439, 0.075, 0.075,
        0.075, 0.075]
-    def __init__(self, onnx_model_path, obs_names, ref_motion_path, lookahead_steps=1, lookahead_frame_skips=1, hist_names=[], hist_length=10, init_at_first_frame=False):
+    def __init__(
+        self,
+        onnx_model_path,
+        obs_names,
+        ref_motion_path,
+        lookahead_steps=1,
+        lookahead_frame_skips=1,
+        hist_names=[],
+        hist_length=10,
+        init_at_first_frame=False,
+        ref_motion_start_index=0,
+    ):
         super().__init__(onnx_model_path, obs_names)
         default_joint_pos = self.meta_data["default_joint_pos"].split(",") if "default_joint_pos" in self.meta_data else RLCHIPPolicy.DEFAULT_Q_POSE
         action_scale = self.meta_data["action_scale"].split(",") if "action_scale" in self.meta_data else RLCHIPPolicy.ACTION_SCALE
@@ -479,17 +548,22 @@ class RLCHIPPolicy(RLBasePolicy):
         
         self.ref_motion = np.load(ref_motion_path)
         self.init_at_first_frame = init_at_first_frame
+        self.motion_length = self.ref_motion["joint_pos"].shape[0]
+        self.ref_motion_start_index = clamp_ref_motion_start_index(ref_motion_start_index, self.motion_length)
+        self.ticker = self.ref_motion_start_index
         if init_at_first_frame:
             # No recentering: use world frame (robot already at first frame on terrain)
             self.init_root_pos = np.zeros(3)
             self.init_root_heading_inv = Rotation.identity()
         else:
-            self.init_root_pos = self.ref_motion["body_pos_w"][0,0].copy()
+            si = self.ref_motion_start_index
+            self.init_root_pos = self.ref_motion["body_pos_w"][si, 0].copy()
             self.init_root_pos[2] = 0  # set initial height to 0 (flat ground)
-            self.init_root_heading_inv = Rotation.from_quat(yaw_quat(self.ref_motion["body_quat_w"][0,0])[[1,2,3,0]]).inv()
+            self.init_root_heading_inv = Rotation.from_quat(
+                yaw_quat(self.ref_motion["body_quat_w"][si, 0])[[1, 2, 3, 0]]
+            ).inv()
         self.vr_3point_indices = [28,29,9] # by calling self.robot.find_bodies(["left_wrist_yaw_link",""right_wrist_yaw_link","torso_link"])
         self.ref_vr_3point_offsets = np.array([[0.18, -0.025, 0.0], [0.18,0.025, 0.0], [0.0,0.0,0.35]])  # relative to anchor point
-        self.motion_length = self.ref_motion["joint_pos"].shape[0]
         self.ref_q_pos = self.ref_motion["joint_pos"].copy()
         self.ref_q_vel = self.ref_motion["joint_vel"].copy()
         self.ref_anchor_poses = self.ref_motion["body_pos_w"][:,0].copy()
@@ -511,7 +585,8 @@ class RLCHIPPolicy(RLBasePolicy):
     
 
     def get_q_init(self):
-        return self.ref_motion["joint_pos"][0, ISAAC_TO_MUJOCO]
+        si = self.ref_motion_start_index
+        return self.ref_motion["joint_pos"][si, ISAAC_TO_MUJOCO]
 
 
     def _control_signals_from_motion(self):
@@ -578,13 +653,34 @@ class RLCHIPPolicy(RLBasePolicy):
         ort_outs = self.session.run(None, ort_inputs)
         if start_ticker:
             self.ticker += 1
-        elif self.ticker > 0:
-            self.ticker = 0
+        elif self.ticker > self.ref_motion_start_index:
+            self.ticker = self.ref_motion_start_index
         return ort_outs[0].flatten()
 
 class RLGlobalCHIPPolicy(RLCHIPPolicy):
-    def __init__(self, onnx_model_path, obs_names, ref_motion_path, lookahead_steps=1, lookahead_frame_skips=1, hist_names=[], hist_length=10, init_at_first_frame=False):
-        super().__init__(onnx_model_path, obs_names, ref_motion_path, lookahead_steps, lookahead_frame_skips, hist_names, hist_length, init_at_first_frame)
+    def __init__(
+        self,
+        onnx_model_path,
+        obs_names,
+        ref_motion_path,
+        lookahead_steps=1,
+        lookahead_frame_skips=1,
+        hist_names=[],
+        hist_length=10,
+        init_at_first_frame=False,
+        ref_motion_start_index=0,
+    ):
+        super().__init__(
+            onnx_model_path,
+            obs_names,
+            ref_motion_path,
+            lookahead_steps,
+            lookahead_frame_skips,
+            hist_names,
+            hist_length,
+            init_at_first_frame,
+            ref_motion_start_index=ref_motion_start_index,
+        )
 
     def prepare_control_signals(self, robot_state):
         _ref_joint_pos, _ref_joint_vel, _ref_anchor_pos, _ref_anchor_orn, _ref_vr_3point_poses, _ref_vr_3point_orns = self._control_signals_from_motion()
@@ -616,8 +712,8 @@ class RLGlobalCHIPPolicy(RLCHIPPolicy):
         ort_outs = self.session.run(None, ort_inputs)
         if start_ticker:
             self.ticker += 1
-        elif self.ticker > 0:
-            self.ticker = 0
+        elif self.ticker > self.ref_motion_start_index:
+            self.ticker = self.ref_motion_start_index
         return ort_outs[0].flatten()
 
 
@@ -636,6 +732,8 @@ class RLContactPolicy(RLBasePolicy):
         zero_foot_contact_on_load=False,
         use_8way_contact=False,
         use_10way_contact=False,
+        use_5dim_contact_from_4dim=False,
+        ref_motion_start_index=0,
     ):
         super().__init__(onnx_model_path, obs_names)
         self.default_value = {
@@ -650,9 +748,17 @@ class RLContactPolicy(RLBasePolicy):
 
         self.lower_joint_indices = ISAAC_TO_MUJOCO[:12]
         self.use_10way_contact = bool(use_10way_contact)
+        self.use_5dim_contact_from_4dim = bool(use_5dim_contact_from_4dim)
+        if self.use_5dim_contact_from_4dim and (not self.use_10way_contact) and use_8way_contact:
+            raise ValueError(
+                "use_5dim_contact_from_4dim (5-dim output) requires use_8way_contact: false, "
+                "or enable use_10way_contact for 10-dim output with zero seat."
+            )
         self.use_8way_contact = bool(use_8way_contact) or self.use_10way_contact
         if self.use_10way_contact:
             self.contact_dim = 10
+        elif self.use_5dim_contact_from_4dim:
+            self.contact_dim = 5
         else:
             self.contact_dim = 8 if use_8way_contact else 4
 
@@ -666,7 +772,13 @@ class RLContactPolicy(RLBasePolicy):
                     f"contact_mask must be 2D (T, C), got shape {self.contact_mask.shape}"
                 )
             tm, tc = self.contact_mask.shape[0], self.contact_mask.shape[1]
-            if self.use_10way_contact:
+            if self.use_10way_contact and self.use_5dim_contact_from_4dim:
+                if tc not in (4, 5, 8, 10):
+                    raise ValueError(
+                        "contact_mask: use_10way_contact + use_5dim_contact_from_4dim expects "
+                        f"4, 5, 8, or 10 columns, got {tc} (T={tm})"
+                    )
+            elif self.use_10way_contact:
                 if tc not in (5, 10):
                     raise ValueError(
                         f"contact_mask: use_10way_contact is True, expected 5 or 10 columns, got {tc} (T={tm})"
@@ -677,7 +789,17 @@ class RLContactPolicy(RLBasePolicy):
                         "contact_mask has 5 columns: use use_10way_contact to expand to 10-way, "
                         "or set use_8way_contact false to keep a 5-dim contact_mask."
                     )
-                if tc not in (4, 5, 8):
+                if self.use_5dim_contact_from_4dim:
+                    if tc == 5:
+                        raise ValueError(
+                            "use_5dim_contact_from_4dim expects 4- or 8-column 4-way data; "
+                            "use a 4-column file or disable this flag for native 5-column labels."
+                        )
+                    if tc not in (4, 8):
+                        raise ValueError(
+                            f"use_5dim_contact_from_4dim: expected 4 or 8 columns, got {tc} (T={tm})"
+                        )
+                elif tc not in (4, 5, 8):
                     raise ValueError(
                         f"contact_mask: expected 4, 5, or 8 columns, got {tc} (T={tm})"
                     )
@@ -687,8 +809,31 @@ class RLContactPolicy(RLBasePolicy):
             elif tm > tlen:
                 self.contact_mask = self.contact_mask[:tlen]
             #self.contact_mask[35:,2:] = 1
-            if self.use_10way_contact:
+            if self.use_10way_contact and self.use_5dim_contact_from_4dim:
+                m = self.contact_mask
+                if tc == 4:
+                    self.contact_mask = expand_4way_limb_to_10way_with_zero_seat(m)
+                elif tc == 5:
+                    self.contact_mask = expand_4way_limb_to_10way_with_zero_seat(m[:, :4])
+                elif tc == 8:
+                    if use_8way_contact:
+                        z2 = np.zeros((m.shape[0], 2), dtype=np.float32)
+                        self.contact_mask = np.hstack([m, z2])
+                    else:
+                        m4 = reduce_8way_contact_to_4(m)
+                        self.contact_mask = expand_4way_limb_to_10way_with_zero_seat(m4)
+                else:  # tc == 10
+                    z2 = np.zeros((m.shape[0], 2), dtype=np.float32)
+                    self.contact_mask = np.hstack([m[:, :8].copy(), z2])
+                self.contact_dim = 10
+            elif self.use_10way_contact:
                 self.contact_mask = normalize_contact_mask_for_10way(self.contact_mask)
+            elif self.use_5dim_contact_from_4dim:
+                m = self.contact_mask
+                if tc == 8:
+                    m = reduce_8way_contact_to_4(m)
+                self.contact_mask = pad_4way_contact_to_5(m)
+                self.contact_dim = 5
             elif tc == 5:
                 self.contact_dim = 5
             else:
@@ -709,21 +854,27 @@ class RLContactPolicy(RLBasePolicy):
             self.contact_mask = np.zeros((tlen, self.contact_dim), dtype=np.float32)
         print(
             f"[RLContactPolicy] contact_mask (T, C)={self.contact_mask.shape} "
-            f"use_8way_contact={use_8way_contact} use_10way_contact={self.use_10way_contact}",
+            f"use_8way_contact={use_8way_contact} use_10way_contact={self.use_10way_contact} "
+            f"use_5dim_contact_from_4dim={self.use_5dim_contact_from_4dim}",
             flush=True,
         )
+        self.motion_length = self.ref_motion["joint_pos"].shape[0]
+        self.ref_motion_start_index = clamp_ref_motion_start_index(ref_motion_start_index, self.motion_length)
+        self.ticker = self.ref_motion_start_index
         self.init_at_first_frame = init_at_first_frame
         if init_at_first_frame:
             # No recentering: use world frame (robot already at first frame on terrain)
             self.init_root_pos = np.zeros(3)
             self.init_root_heading_inv = Rotation.identity()
         else:
-            self.init_root_pos = self.ref_motion["body_pos_w"][0,0].copy()
+            si = self.ref_motion_start_index
+            self.init_root_pos = self.ref_motion["body_pos_w"][si, 0].copy()
             self.init_root_pos[2] = 0  # set initial height to 0 (flat ground)
-            self.init_root_heading_inv = Rotation.from_quat(yaw_quat(self.ref_motion["body_quat_w"][0,0])[[1,2,3,0]]).inv()
+            self.init_root_heading_inv = Rotation.from_quat(
+                yaw_quat(self.ref_motion["body_quat_w"][si, 0])[[1, 2, 3, 0]]
+            ).inv()
         self.vr_3point_indices = [28,29,9] # by calling self.robot.find_bodies(["left_wrist_yaw_link",""right_wrist_yaw_link","torso_link"])
         self.ref_vr_3point_offsets = np.array([[0.18, -0.025, 0.0], [0.18,0.025, 0.0], [0.0,0.0,0.35]])  # relative to anchor point
-        self.motion_length = self.ref_motion["joint_pos"].shape[0]
         self.ref_q_pos = self.ref_motion["joint_pos"].copy()
         self.ref_q_vel = self.ref_motion["joint_vel"].copy()
         self.ref_anchor_poses = self.ref_motion["body_pos_w"][:,0].copy()
@@ -745,7 +896,8 @@ class RLContactPolicy(RLBasePolicy):
     
 
     def get_q_init(self):
-        return self.ref_motion["joint_pos"][0, ISAAC_TO_MUJOCO]
+        si = self.ref_motion_start_index
+        return self.ref_motion["joint_pos"][si, ISAAC_TO_MUJOCO]
 
 
     def _control_signals_from_motion(self):
@@ -788,6 +940,7 @@ class RLContactPolicy(RLBasePolicy):
         control_signals["compliance"] = self.keyboard_controller.get_compliance()
         mid = self.ticker if self.ticker < self.motion_length else self.motion_length-1
         control_signals["contact_mask"] = self.contact_mask[mid]
+        print(control_signals["contact_mask"])
         return control_signals
 
     def prepare_obs(self, robot_state, control_signals):
@@ -814,8 +967,8 @@ class RLContactPolicy(RLBasePolicy):
         ort_outs = self.session.run(None, ort_inputs)
         if start_ticker:
             self.ticker += 1
-        elif self.ticker > 0:
-            self.ticker = 0
+        elif self.ticker > self.ref_motion_start_index:
+            self.ticker = self.ref_motion_start_index
         return ort_outs[0].flatten()
 
 
@@ -836,8 +989,12 @@ class RLStreamingContactPolicy(RLBasePolicy):
         default_contact_label=None,
         use_8way_contact=False,
         use_10way_contact=False,
+        use_5dim_contact_from_4dim=False,
+        ref_motion_start_index=0,
     ):
         super().__init__(onnx_model_path, obs_names)
+        self.ref_motion_start_index = max(0, int(ref_motion_start_index))
+        self._limb_contact_file_is_8way = bool(use_8way_contact)
         self.default_value = {
             "q": np.array([float(x) for x in self.meta_data["default_joint_pos"].split(",")]),
             "dq": np.zeros(29),
@@ -849,9 +1006,17 @@ class RLStreamingContactPolicy(RLBasePolicy):
             self.action_scale = self.action_scale[ISAAC_TO_MUJOCO]
 
         self.use_10way_contact = bool(use_10way_contact)
+        self.use_5dim_contact_from_4dim = bool(use_5dim_contact_from_4dim)
+        if self.use_5dim_contact_from_4dim and (not self.use_10way_contact) and use_8way_contact:
+            raise ValueError(
+                "use_5dim_contact_from_4dim (5-dim output) requires use_8way_contact: false, "
+                "or enable use_10way_contact for 10-dim output with zero seat."
+            )
         self.use_8way_contact = bool(use_8way_contact) or self.use_10way_contact
         if self.use_10way_contact:
             self.contact_dim = 10
+        elif self.use_5dim_contact_from_4dim:
+            self.contact_dim = 5
         else:
             self.contact_dim = 8 if use_8way_contact else 4
         self.motion_length = int(1e9)
@@ -897,7 +1062,38 @@ class RLStreamingContactPolicy(RLBasePolicy):
             self.latest_contact_mask = np.zeros(self.contact_dim, dtype=np.float32)
         else:
             parsed_default_contact = np.asarray(default_contact_label, dtype=np.float32).reshape(-1)
-            if self.use_10way_contact:
+            if self.use_10way_contact and self.use_5dim_contact_from_4dim:
+                p = parsed_default_contact
+                n = p.size
+                if n == 4:
+                    parsed_default_contact = expand_4way_limb_to_10way_with_zero_seat(
+                        p.reshape(1, -1)
+                    ).reshape(-1)
+                elif n == 5:
+                    parsed_default_contact = expand_4way_limb_to_10way_with_zero_seat(
+                        p[:4].reshape(1, -1)
+                    ).reshape(-1)
+                elif n == 8:
+                    if self._limb_contact_file_is_8way:
+                        parsed_default_contact = np.hstack([p, np.zeros(2, dtype=np.float32)]).reshape(-1)
+                    else:
+                        m4 = reduce_8way_contact_to_4(p.reshape(1, -1)).reshape(-1)
+                        parsed_default_contact = expand_4way_limb_to_10way_with_zero_seat(
+                            m4.reshape(1, -1)
+                        ).reshape(-1)
+                elif n == 10:
+                    parsed_default_contact = np.hstack([p[:8], np.zeros(2, dtype=np.float32)]).reshape(-1)
+                else:
+                    raise ValueError(
+                        "default_contact_label: use_10way_contact + use_5dim_contact_from_4dim expects "
+                        f"4, 5, 8, or 10 values, got {n}"
+                    )
+                if parsed_default_contact.size != self.contact_dim:
+                    raise ValueError(
+                        f"default_contact_label: expected {self.contact_dim} values after pad, "
+                        f"got {parsed_default_contact.size}"
+                    )
+            elif self.use_10way_contact:
                 if parsed_default_contact.size == 5:
                     parsed_default_contact = expand_5way_contact_to_10(
                         parsed_default_contact.reshape(1, -1)
@@ -906,6 +1102,20 @@ class RLStreamingContactPolicy(RLBasePolicy):
                     raise ValueError(
                         "default_contact_label: use_10way_contact expects 5 values "
                         f"(4-way + pelvis_seat) or {self.contact_dim}, got {parsed_default_contact.size}"
+                    )
+            elif self.use_5dim_contact_from_4dim:
+                if parsed_default_contact.size == 4:
+                    parsed_default_contact = pad_4way_contact_to_5(
+                        parsed_default_contact.reshape(1, -1)
+                    ).reshape(-1)
+                elif parsed_default_contact.size == 5:
+                    parsed_default_contact = np.asarray(
+                        np.hstack([parsed_default_contact[:4], 0.0]), dtype=np.float32
+                    ).reshape(-1)
+                if parsed_default_contact.size != self.contact_dim:
+                    raise ValueError(
+                        "default_contact_label: use_5dim_contact_from_4dim expects 4 values "
+                        f"(padded to 5) or 5 (5th forced to 0), got {parsed_default_contact.size}"
                     )
             elif parsed_default_contact.size != self.contact_dim:
                 raise ValueError(
@@ -952,7 +1162,8 @@ class RLStreamingContactPolicy(RLBasePolicy):
         }
         print(
             f"[RLStreamingContactPolicy] contact_dim={self.contact_dim} "
-            f"use_8way_contact={use_8way_contact} use_10way_contact={self.use_10way_contact} — Listening Redis channels:"
+            f"use_8way_contact={use_8way_contact} use_10way_contact={self.use_10way_contact} "
+            f"use_5dim_contact_from_4dim={self.use_5dim_contact_from_4dim} — Listening Redis channels:"
             f" {self.redis_channels['lower_cmd']}, {self.redis_channels['vr_3point_pos_l']},"
             f" {self.redis_channels['vr_3point_orn_l']}, {self.redis_channels['contact_mask']},"
             f" {self.redis_channels['motion_anchor_pos_w']}, {self.redis_channels['motion_anchor_orn_w']}"
@@ -999,12 +1210,44 @@ class RLStreamingContactPolicy(RLBasePolicy):
                 elif key == "contact_mask":
                     arr = pickle.loads(data)
                     arr = np.asarray(arr, dtype=np.float32).reshape(-1)
-                    if self.use_10way_contact:
+                    if self.use_10way_contact and self.use_5dim_contact_from_4dim:
+                        n = arr.size
+                        if n == 4:
+                            arr = expand_4way_limb_to_10way_with_zero_seat(arr.reshape(1, -1)).reshape(-1)
+                        elif n == 5:
+                            arr = expand_4way_limb_to_10way_with_zero_seat(arr[:4].reshape(1, -1)).reshape(-1)
+                        elif n == 8:
+                            if self._limb_contact_file_is_8way:
+                                arr = np.hstack([arr, np.zeros(2, dtype=np.float32)])
+                            else:
+                                m4 = reduce_8way_contact_to_4(arr.reshape(1, -1)).reshape(-1)
+                                arr = expand_4way_limb_to_10way_with_zero_seat(m4.reshape(1, -1)).reshape(-1)
+                        elif n == 10:
+                            arr = np.hstack([arr[:8], np.zeros(2, dtype=np.float32)])
+                        else:
+                            raise ValueError(
+                                f"contact stream: use_10way + use_5dim_from_4dim expected 4,5,8,10 values, got {n}"
+                            )
+                        if arr.size != self.contact_dim:
+                            raise ValueError(
+                                f"contact stream: expected {self.contact_dim} values after pad, got {arr.size}"
+                            )
+                    elif self.use_10way_contact:
                         if arr.size == 5:
                             arr = expand_5way_contact_to_10(arr.reshape(1, -1)).reshape(-1)
                         if arr.size != self.contact_dim:
                             raise ValueError(
                                 f"contact stream: expected 5 or {self.contact_dim} values, got {arr.size}"
+                            )
+                    elif self.use_5dim_contact_from_4dim:
+                        if arr.size == 4:
+                            arr = pad_4way_contact_to_5(arr.reshape(1, -1)).reshape(-1)
+                        elif arr.size == 5:
+                            arr = arr.copy()
+                            arr[4] = 0.0
+                        if arr.size != self.contact_dim:
+                            raise ValueError(
+                                f"contact stream: expected 4 or {self.contact_dim} values, got {arr.size}"
                             )
                     elif arr.size != self.contact_dim:
                         raise ValueError(f"Expected payload size {self.contact_dim}, got {arr.size}")
@@ -1071,6 +1314,6 @@ class RLStreamingContactPolicy(RLBasePolicy):
         ort_outs = self.session.run(None, ort_inputs)
         if start_ticker:
             self.ticker += 1
-        elif self.ticker > 0:
-            self.ticker = 0
+        elif self.ticker > self.ref_motion_start_index:
+            self.ticker = self.ref_motion_start_index
         return ort_outs[0].flatten()

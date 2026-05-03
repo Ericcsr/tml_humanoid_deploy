@@ -13,6 +13,7 @@ from rl_policy import (
     RLContactPolicy,
     RLGlobalCHIPPolicy,
     RLStreamingContactPolicy,
+    clamp_ref_motion_start_index,
 )
 
 from utils.params import DEFAULT_POSE, ACTION_SCALE, ISAAC_TO_MUJOCO
@@ -104,7 +105,7 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
     joint_errors, root_pos_errors, root_orn_errors = [], [], []
     robot_traj, ref_traj = [], []  # root trajectories for visualization
     motion_length = policy.motion_length
-    init_offset = None  # (pos_offset, (robot_orn_0, ref_orn_0)) from frame 0 for first-frame alignment
+    init_offset = None  # alignment from ref_motion_start_index frame when --metric
     heading_align_rot = None  # rotation to align robot's initial heading with ref (removes heading-induced xy drift)
 
     while True:
@@ -145,12 +146,16 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
         # So robot = result of (ticker-1) steps, ref frame (ticker-1) is the one we used for that action.
         # Requires use_root_state for root_pos/root_orn.
         if compute_metrics_flag and config["use_root_state"]:
-            mid = max(0, policy.ticker - 1) if policy.ticker > 0 else 0
+            si = getattr(policy, "ref_motion_start_index", 0)
+            if policy.ticker > si:
+                mid = policy.ticker - 1
+            else:
+                mid = si
             mid = min(mid, motion_length - 1)
-            # Capture init offset at frame 0 for first-frame alignment (robot may start elsewhere than ref)
-            if mid == 0 and init_offset is None:
-                ref_anchor_pos_0 = policy.ref_anchor_poses[0]
-                ref_anchor_orn_0 = policy.ref_anchor_orns[0]
+            # Capture init offset at start frame for first-frame alignment (robot may start elsewhere than ref)
+            if mid == si and init_offset is None:
+                ref_anchor_pos_0 = policy.ref_anchor_poses[si]
+                ref_anchor_orn_0 = policy.ref_anchor_orns[si]
                 robot_rel_pos_0 = policy.init_root_heading_inv.apply(robot_state.root_pos - policy.init_root_pos)
                 ref_rel_pos_0 = policy.init_root_heading_inv.apply(ref_anchor_pos_0 - policy.init_root_pos)
                 robot_rel_orn_0 = (policy.init_root_heading_inv * Rotation.from_quat(robot_state.root_orn)).as_quat()
@@ -244,19 +249,35 @@ if __name__ == "__main__":
         or (has_terrain_box and args.use_sim)
         or (has_object and args.use_sim)
     )
+    _ref_for_start_index = None
+    if config.get("ref_motion_path"):
+        _ref_for_start_index = np.load(config["ref_motion_path"])
+        config["ref_motion_start_index"] = clamp_ref_motion_start_index(
+            int(config.get("ref_motion_start_index", 0)),
+            int(_ref_for_start_index["joint_pos"].shape[0]),
+        )
+    else:
+        config["ref_motion_start_index"] = 0
     if init_at_first_frame:
         from utils.params import ISAAC_TO_MUJOCO
-        ref_motion = np.load(config["ref_motion_path"])
-        config["sim_init_root_pos"] = ref_motion["body_pos_w"][0, 0].copy()
-        config["sim_init_root_orn"] = ref_motion["body_quat_w"][0, 0][[1, 2, 3, 0]].copy()
-        config["sim_init_joint_pos"] = ref_motion["joint_pos"][0, ISAAC_TO_MUJOCO].copy()
-        print(f"[run_controller] Init at first frame: xy=({config['sim_init_root_pos'][0]:.2f}, {config['sim_init_root_pos'][1]:.2f}) z={config['sim_init_root_pos'][2]:.2f}", flush=True)
+        ref_motion = _ref_for_start_index
+        if ref_motion is None:
+            ref_motion = np.load(config["ref_motion_path"])
+        si = config["ref_motion_start_index"]
+        config["sim_init_root_pos"] = ref_motion["body_pos_w"][si, 0].copy()
+        config["sim_init_root_orn"] = ref_motion["body_quat_w"][si, 0][[1, 2, 3, 0]].copy()
+        config["sim_init_joint_pos"] = ref_motion["joint_pos"][si, ISAAC_TO_MUJOCO].copy()
+        print(
+            f"[run_controller] Init at ref frame {si}: xy=({config['sim_init_root_pos'][0]:.2f}, "
+            f"{config['sim_init_root_pos'][1]:.2f}) z={config['sim_init_root_pos'][2]:.2f}",
+            flush=True,
+        )
 
     if args.use_sim:
         from mujoco_env import MujocoRobot
         from ref_motion_visualizer import start_ref_visualizer_process
 
-        ticker_value = Value("f", 0.0)
+        ticker_value = Value("f", float(config["ref_motion_start_index"]))
         env = MujocoRobot(config["mujoco_xml_path"], config, ticker_value=ticker_value)
         # Only start ref motion visualizer when --metric is enabled
         if args.metric:
@@ -265,6 +286,7 @@ if __name__ == "__main__":
                 config["ref_motion_path"],
                 control_dt=config.get("control_dt", 0.02),
                 ticker_value=ticker_value,
+                ref_motion_start_index=config["ref_motion_start_index"],
             )
         else:
             ref_vis_process = None
@@ -277,20 +299,40 @@ if __name__ == "__main__":
     lookahead_steps = config.get("lookahead_steps",1)
     lookahead_frame_skips = config.get("lookahead_frame_skips",1)
     if args.vr:
-        policy = RL3ptPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
-                            lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
-                            init_at_first_frame=init_at_first_frame)
+        policy = RL3ptPolicy(
+            config["onnx_model_path"],
+            config["obs_names"],
+            config["ref_motion_path"],
+            lookahead_steps=lookahead_steps,
+            lookahead_frame_skips=lookahead_frame_skips,
+            init_at_first_frame=init_at_first_frame,
+            ref_motion_start_index=config["ref_motion_start_index"],
+        )
     elif config.get("use_chip", False):
         if config.get("only_3pt", False):
-            policy = RLGlobalCHIPPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
-                            lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
-                            hist_names=config.get("history_names", []), hist_length=config.get("history_length", 1),
-                            init_at_first_frame=init_at_first_frame)
+            policy = RLGlobalCHIPPolicy(
+                config["onnx_model_path"],
+                config["obs_names"],
+                config["ref_motion_path"],
+                lookahead_steps=lookahead_steps,
+                lookahead_frame_skips=lookahead_frame_skips,
+                hist_names=config.get("history_names", []),
+                hist_length=config.get("history_length", 1),
+                init_at_first_frame=init_at_first_frame,
+                ref_motion_start_index=config["ref_motion_start_index"],
+            )
         else:
-            policy = RLCHIPPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
-                                lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
-                                hist_names=config.get("history_names", []), hist_length=config.get("history_length", 1),
-                                init_at_first_frame=init_at_first_frame)                    
+            policy = RLCHIPPolicy(
+                config["onnx_model_path"],
+                config["obs_names"],
+                config["ref_motion_path"],
+                lookahead_steps=lookahead_steps,
+                lookahead_frame_skips=lookahead_frame_skips,
+                hist_names=config.get("history_names", []),
+                hist_length=config.get("history_length", 1),
+                init_at_first_frame=init_at_first_frame,
+                ref_motion_start_index=config["ref_motion_start_index"],
+            )                    
     elif config.get("use_streaming_motion", False):
         policy = RLStreamingContactPolicy(
             config["onnx_model_path"],
@@ -305,6 +347,8 @@ if __name__ == "__main__":
             default_contact_label=config.get("default_contact_label", None),
             use_8way_contact=config.get("use_8way_contact", False),
             use_10way_contact=config.get("use_10way_contact", False),
+            use_5dim_contact_from_4dim=config.get("use_5dim_contact_from_4dim", False),
+            ref_motion_start_index=config["ref_motion_start_index"],
         )
     elif config.get("use_contact", False):
         policy = RLContactPolicy(
@@ -320,11 +364,19 @@ if __name__ == "__main__":
             zero_foot_contact_on_load=config.get("zero_foot_contact_on_load", False),
             use_8way_contact=config.get("use_8way_contact", False),
             use_10way_contact=config.get("use_10way_contact", False),
+            use_5dim_contact_from_4dim=config.get("use_5dim_contact_from_4dim", False),
+            ref_motion_start_index=config["ref_motion_start_index"],
         )
     else:
-        policy = RLBMPolicy(config["onnx_model_path"], config["obs_names"], config["ref_motion_path"], 
-                            lookahead_steps=lookahead_steps, lookahead_frame_skips=lookahead_frame_skips,
-                            init_at_first_frame=init_at_first_frame)
+        policy = RLBMPolicy(
+            config["onnx_model_path"],
+            config["obs_names"],
+            config["ref_motion_path"],
+            lookahead_steps=lookahead_steps,
+            lookahead_frame_skips=lookahead_frame_skips,
+            init_at_first_frame=init_at_first_frame,
+            ref_motion_start_index=config["ref_motion_start_index"],
+        )
 
     try:
         result = main(env, policy, config, ticker_value=ticker_value, compute_metrics_flag=args.metric)

@@ -9,8 +9,9 @@ single mesh collision geom is used (controller config: terrain_mesh_collision: t
 Note: MuJoCo mesh collision still uses a convex hull per mesh geom (not the column decomposition).
 
 Procedural box terrain (no URDF): use ``terrain_box_pos`` / ``terrain_box_size`` (single box) or
-``terrain_boxes`` — a dict (name -> {pos, size, rgba?}) or a list of {pos, size, rgba?, name?};
-see merge_terrain_box_into_scene_xml and merge_terrain_boxes_into_scene_xml.
+``terrain_boxes`` — a dict (name -> {pos, size, rgba?, yaw? / yaw_deg?}) or a list of
+{pos, size, rgba?, name?, yaw? / yaw_deg?}; yaw is rotation about +Z through the box center (rad
+or deg). See merge_terrain_box_into_scene_xml and merge_terrain_boxes_into_scene_xml.
 
 URDF terrain position in world: config key terrain_urdf_offset [x, y, z] (m) wraps merged terrain
 bodies in a static parent body; see merge_terrain_into_scene_from_string.
@@ -19,6 +20,7 @@ see merge_free_box_into_scene_xml.
 """
 import os
 import re
+import math
 import xml.etree.ElementTree as ET
 import numpy as np
 from typing import List, Optional, Tuple
@@ -430,15 +432,23 @@ def _sanitize_terrain_box_body_name(label: str) -> str:
     return s
 
 
+def _yaw_about_z_to_mujoco_quat_wxyz(yaw_rad: float) -> Tuple[float, float, float, float]:
+    """MuJoCo body quat format: w x y z; rotation about world +Z by yaw (right-hand)."""
+    h = 0.5 * float(yaw_rad)
+    return (math.cos(h), 0.0, 0.0, math.sin(h))
+
+
 def terrain_box_body_xml_fragment(
     pos_xyz: Tuple[float, float, float],
     size_xyz: Tuple[float, float, float],
     rgba: Tuple[float, float, float, float] = (0.55, 0.52, 0.48, 1.0),
     body_name: str = "terrain_box",
+    yaw_rad: float = 0.0,
 ) -> str:
     """
-    One static axis-aligned box body/geom (indentation for worldbody child). ``body_name`` must be
-    unique in the model; geom is named ``{body_name}_geom``.
+    One static box body/geom (indentation for worldbody child). ``body_name`` must be unique in
+    the model; geom is named ``{body_name}_geom``. Optional ``yaw_rad`` rotates the box about +Z
+    through its center (``pos`` is the box center).
     """
     bname = _sanitize_terrain_box_body_name(body_name)
     hx = float(size_xyz[0]) / 2.0
@@ -446,8 +456,9 @@ def terrain_box_body_xml_fragment(
     hz = float(size_xyz[2]) / 2.0
     px, py, pz = float(pos_xyz[0]), float(pos_xyz[1]), float(pos_xyz[2])
     r, g, b, a = float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3])
+    qw, qx, qy, qz = _yaw_about_z_to_mujoco_quat_wxyz(yaw_rad)
     return (
-        f'    <body name="{bname}" pos="{px} {py} {pz}" quat="1 0 0 0">\n'
+        f'    <body name="{bname}" pos="{px} {py} {pz}" quat="{qw} {qx} {qy} {qz}">\n'
         f'      <geom name="{bname}_geom" type="box" pos="0 0 0" size="{hx} {hy} {hz}" '
         f'contype="1" conaffinity="1" rgba="{r} {g} {b} {a}"/>\n'
         f"    </body>"
@@ -462,6 +473,7 @@ def merge_terrain_boxes_into_scene_xml(
             Tuple[float, float, float],
             Tuple[float, float, float],
             Optional[Tuple[float, float, float, float]],
+            float,
         ]
     ],
     default_rgba: Tuple[float, float, float, float] = (0.55, 0.52, 0.48, 1.0),
@@ -470,8 +482,9 @@ def merge_terrain_boxes_into_scene_xml(
     Insert several static box bodies (one fragment, order preserved: first in ``boxes`` is first
     in worldbody after ``<worldbody>``).
 
-    Each tuple is (label_for_body_name, pos_xyz, size_xyz, rgba_or_none). Body names are
-    sanitized; geom names are ``{body}_geom``.
+    Each tuple is (label_for_body_name, pos_xyz, size_xyz, rgba_or_none, yaw_rad). Body names are
+    sanitized; geom names are ``{body}_geom``. ``yaw_rad`` is rotation about +Z through the box
+    center (0 = axis-aligned with world).
 
     If ``boxes`` is empty, returns ``scene_xml`` unchanged.
     """
@@ -479,7 +492,7 @@ def merge_terrain_boxes_into_scene_xml(
         return scene_xml
     parts: List[str] = []
     used: set = set()
-    for label, pos_xyz, size_xyz, rgba in boxes:
+    for label, pos_xyz, size_xyz, rgba, yaw_rad in boxes:
         bname = _sanitize_terrain_box_body_name(label)
         if bname in used:
             raise ValueError(f"Duplicate terrain box body name after sanitize: {bname!r} (from {label!r})")
@@ -487,7 +500,9 @@ def merge_terrain_boxes_into_scene_xml(
         rgba_t = default_rgba if rgba is None else rgba
         if len(rgba_t) != 4:
             raise ValueError("each terrain box rgba must be length-4 [r,g,b,a]")
-        parts.append(terrain_box_body_xml_fragment(pos_xyz, size_xyz, rgba_t, body_name=label))
+        parts.append(
+            terrain_box_body_xml_fragment(pos_xyz, size_xyz, rgba_t, body_name=label, yaw_rad=yaw_rad)
+        )
     return _insert_after_worldbody_open(scene_xml, "\n".join(parts))
 
 
@@ -496,19 +511,21 @@ def merge_terrain_box_into_scene_xml(
     pos_xyz: Tuple[float, float, float],
     size_xyz: Tuple[float, float, float],
     rgba: Tuple[float, float, float, float] = (0.55, 0.52, 0.48, 1.0),
+    yaw_rad: float = 0.0,
 ) -> str:
     """
-    Insert a static axis-aligned box (world body) — simple procedural terrain / platform.
+    Insert a static box (world body) — simple procedural terrain / platform.
 
     Args:
         pos_xyz: World position of the box center (m).
         size_xyz: Full outer dimensions (lx, ly, lz) in meters; converted to MuJoCo half-sizes.
         rgba: Visual/collision rgba (alpha only affects visualization).
+        yaw_rad: Rotation about +Z (rad) through the box center.
 
     The body is named ``terrain_box``; geom ``terrain_box_geom`` (see terrain_box_body_xml_fragment).
     """
     return merge_terrain_boxes_into_scene_xml(
-        scene_xml, [("terrain_box", pos_xyz, size_xyz, rgba)]
+        scene_xml, [("terrain_box", pos_xyz, size_xyz, rgba, yaw_rad)]
     )
 
 

@@ -31,16 +31,22 @@ def _run_dual_robot_visualizer(
     ref_motion_path: str,
     control_dt: float,
     ticker_value,
+    ref_motion_start_index: int = 0,
 ):
     """Run the visualizer showing both robot and reference motion."""
     # Load reference motion
     ref_motion = np.load(ref_motion_path)
-    init_root_pos = ref_motion["body_pos_w"][0, 0].copy()
+    motion_length = ref_motion["joint_pos"].shape[0]
+    si = int(ref_motion_start_index)
+    if si < 0:
+        si = 0
+    if si >= motion_length:
+        si = motion_length - 1
+    init_root_pos = ref_motion["body_pos_w"][si, 0].copy()
     init_root_pos[2] = 0
     init_root_heading_inv = Rotation.from_quat(
-        yaw_quat(ref_motion["body_quat_w"][0, 0])[[1, 2, 3, 0]]
+        yaw_quat(ref_motion["body_quat_w"][si, 0])[[1, 2, 3, 0]]
     ).inv()
-    motion_length = ref_motion["joint_pos"].shape[0]
     ref_q_pos = ref_motion["joint_pos"].copy()
     ref_anchor_poses = ref_motion["body_pos_w"][:, 0].copy()
     ref_anchor_orns = ref_motion["body_quat_w"][:, 0][:, [1, 2, 3, 0]].copy()
@@ -104,13 +110,14 @@ def start_ref_visualizer_process(
     ref_motion_path: str,
     control_dt: float = 0.02,
     ticker_value=None,
+    ref_motion_start_index: int = 0,
 ) -> mp.Process:
     """Start the reference motion visualizer in a separate process.
     ticker_value: multiprocessing.Value('f') shared with run_controller for sync.
     """
     process = mp.Process(
         target=_run_dual_robot_visualizer,
-        args=(xml_path, ref_motion_path, control_dt, ticker_value),
+        args=(xml_path, ref_motion_path, control_dt, ticker_value, ref_motion_start_index),
     )
     process.start()
     return process
