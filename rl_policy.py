@@ -33,6 +33,90 @@ def clamp_ref_motion_start_index(start: int, motion_length: int) -> int:
     return s
 
 
+def _parse_slow_motion_params(
+    slow_motion_end_frame,
+    slow_down_times,
+    motion_length: int,
+):
+    """Return validated (end_frame, repeat_times), or (None, None) when disabled."""
+    if motion_length <= 0:
+        return None, None
+    if slow_motion_end_frame is None or slow_down_times is None:
+        return None, None
+    try:
+        end_frame = int(slow_motion_end_frame)
+        repeat_times = int(slow_down_times)
+    except (TypeError, ValueError):
+        return None, None
+    if end_frame <= 0 or repeat_times <= 1:
+        return None, None
+    end_frame = min(end_frame, motion_length)
+    if end_frame <= 0:
+        return None, None
+    return end_frame, repeat_times
+
+
+def _stretch_prefix_along_time(arr: np.ndarray, end_frame: int, repeat_times: int) -> np.ndarray:
+    """Repeat frames [0:end_frame) along axis-0 by repeat_times."""
+    prefix = np.repeat(arr[:end_frame], repeat_times, axis=0)
+    return np.concatenate((prefix, arr[end_frame:]), axis=0)
+
+
+def load_ref_motion_with_optional_slowdown(
+    ref_motion_path: str,
+    slow_motion_end_frame=None,
+    slow_down_times=None,
+):
+    """
+    Load ref motion (.npz), optionally stretching first end_frame frames by repeat_times.
+    Returns either the original np.load object or a dict[str, np.ndarray] with stretched data.
+    """
+    ref_motion = np.load(ref_motion_path)
+    motion_length = int(ref_motion["joint_pos"].shape[0])
+    end_frame, repeat_times = _parse_slow_motion_params(
+        slow_motion_end_frame, slow_down_times, motion_length
+    )
+    if end_frame is None:
+        return ref_motion
+
+    stretched = {}
+    for key in ref_motion.files:
+        value = np.asarray(ref_motion[key])
+        if value.ndim > 0 and value.shape[0] == motion_length:
+            stretched[key] = _stretch_prefix_along_time(value, end_frame, repeat_times)
+        else:
+            stretched[key] = value.copy()
+    print(
+        f"[ref_motion] slow prefix enabled: first {end_frame} frames x{repeat_times} "
+        f"(length {motion_length} -> {stretched['joint_pos'].shape[0]})",
+        flush=True,
+    )
+    return stretched
+
+
+def stretch_contact_mask_prefix_if_enabled(
+    contact_mask: np.ndarray,
+    slow_motion_end_frame=None,
+    slow_down_times=None,
+) -> np.ndarray:
+    """Apply the same slow-prefix stretching on a (T, C) contact mask."""
+    mask = np.asarray(contact_mask, dtype=np.float32)
+    if mask.ndim != 2:
+        return mask
+    end_frame, repeat_times = _parse_slow_motion_params(
+        slow_motion_end_frame, slow_down_times, int(mask.shape[0])
+    )
+    if end_frame is None:
+        return mask
+    stretched = _stretch_prefix_along_time(mask, end_frame, repeat_times).astype(np.float32)
+    print(
+        f"[contact_mask] slow prefix enabled: first {end_frame} frames x{repeat_times} "
+        f"(length {mask.shape[0]} -> {stretched.shape[0]})",
+        flush=True,
+    )
+    return stretched
+
+
 def expand_4way_contact_to_8(m4: np.ndarray) -> np.ndarray:
     """
     4-way [Lfoot, Rfoot, Lwrist, Rwrist] -> 8-way
@@ -242,10 +326,14 @@ class KeyboardController:
 
 # base policy for deploy beyond mimic model
 class RLBasePolicy:
-    def __init__(self, onnx_model_path, obs_names):
+    def __init__(self, onnx_model_path, obs_names, use_sim=False):
         self.onnx_model_path = onnx_model_path
         self.obs_names = obs_names
-        self.session = onnxruntime.InferenceSession(onnx_model_path, providers=['CUDAExecutionProvider'])
+        if use_sim:
+            providers = ["CPUExecutionProvider"]
+        else:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        self.session = onnxruntime.InferenceSession(onnx_model_path, providers=providers)
         self.input_shape = tuple(self.session.get_inputs()[0].shape)
         self.meta_data = self.session.get_modelmeta().custom_metadata_map
         self.ticker = 0
@@ -282,12 +370,15 @@ class RLBMPolicy(RLBasePolicy):
         onnx_model_path,
         obs_names,
         ref_motion_path,
+        use_sim=False,
         lookahead_steps=1,
         lookahead_frame_skips=1,
         init_at_first_frame=False,
         ref_motion_start_index=0,
+        slow_motion_end_frame=None,
+        slow_down_times=None,
     ):
-        super().__init__(onnx_model_path, obs_names)
+        super().__init__(onnx_model_path, obs_names, use_sim=use_sim)
         
 
         self.default_value = {
@@ -300,7 +391,11 @@ class RLBMPolicy(RLBasePolicy):
         else:
             self.action_scale = self.action_scale[ISAAC_TO_MUJOCO]
         
-        self.ref_motion = np.load(ref_motion_path)
+        self.ref_motion = load_ref_motion_with_optional_slowdown(
+            ref_motion_path,
+            slow_motion_end_frame=slow_motion_end_frame,
+            slow_down_times=slow_down_times,
+        )
         self.motion_length = self.ref_motion["joint_pos"].shape[0]
         self.ref_motion_start_index = clamp_ref_motion_start_index(ref_motion_start_index, self.motion_length)
         self.ticker = self.ref_motion_start_index
@@ -389,13 +484,20 @@ class RL3ptPolicy(RLBasePolicy):
         onnx_model_path,
         obs_names,
         ref_motion_path,
+        use_sim=False,
         lookahead_steps=1,
         lookahead_frame_skips=1,
         init_at_first_frame=False,
         ref_motion_start_index=0,
+        slow_motion_end_frame=None,
+        slow_down_times=None,
     ):
-        super().__init__(onnx_model_path, obs_names)
-        self.ref_motion = np.load(ref_motion_path)
+        super().__init__(onnx_model_path, obs_names, use_sim=use_sim)
+        self.ref_motion = load_ref_motion_with_optional_slowdown(
+            ref_motion_path,
+            slow_motion_end_frame=slow_motion_end_frame,
+            slow_down_times=slow_down_times,
+        )
 
         self.default_value = {
             "q": np.array([float(x) for x in self.meta_data["default_joint_pos"].split(",")]),
@@ -520,14 +622,17 @@ class RLCHIPPolicy(RLBasePolicy):
         onnx_model_path,
         obs_names,
         ref_motion_path,
+        use_sim=False,
         lookahead_steps=1,
         lookahead_frame_skips=1,
         hist_names=[],
         hist_length=10,
         init_at_first_frame=False,
         ref_motion_start_index=0,
+        slow_motion_end_frame=None,
+        slow_down_times=None,
     ):
-        super().__init__(onnx_model_path, obs_names)
+        super().__init__(onnx_model_path, obs_names, use_sim=use_sim)
         default_joint_pos = self.meta_data["default_joint_pos"].split(",") if "default_joint_pos" in self.meta_data else RLCHIPPolicy.DEFAULT_Q_POSE
         action_scale = self.meta_data["action_scale"].split(",") if "action_scale" in self.meta_data else RLCHIPPolicy.ACTION_SCALE
         if "default_joint_pos" in self.meta_data:
@@ -546,7 +651,11 @@ class RLCHIPPolicy(RLBasePolicy):
 
         self.lower_joint_indices = ISAAC_TO_MUJOCO[:12]
         
-        self.ref_motion = np.load(ref_motion_path)
+        self.ref_motion = load_ref_motion_with_optional_slowdown(
+            ref_motion_path,
+            slow_motion_end_frame=slow_motion_end_frame,
+            slow_down_times=slow_down_times,
+        )
         self.init_at_first_frame = init_at_first_frame
         self.motion_length = self.ref_motion["joint_pos"].shape[0]
         self.ref_motion_start_index = clamp_ref_motion_start_index(ref_motion_start_index, self.motion_length)
@@ -663,23 +772,29 @@ class RLGlobalCHIPPolicy(RLCHIPPolicy):
         onnx_model_path,
         obs_names,
         ref_motion_path,
+        use_sim=False,
         lookahead_steps=1,
         lookahead_frame_skips=1,
         hist_names=[],
         hist_length=10,
         init_at_first_frame=False,
         ref_motion_start_index=0,
+        slow_motion_end_frame=None,
+        slow_down_times=None,
     ):
         super().__init__(
             onnx_model_path,
             obs_names,
             ref_motion_path,
+            use_sim,
             lookahead_steps,
             lookahead_frame_skips,
             hist_names,
             hist_length,
             init_at_first_frame,
             ref_motion_start_index=ref_motion_start_index,
+            slow_motion_end_frame=slow_motion_end_frame,
+            slow_down_times=slow_down_times,
         )
 
     def prepare_control_signals(self, robot_state):
@@ -724,6 +839,7 @@ class RLContactPolicy(RLBasePolicy):
         obs_names,
         ref_motion_path,
         contact_labels_path,
+        use_sim=False,
         lookahead_steps=1,
         lookahead_frame_skips=1,
         hist_names=[],
@@ -734,8 +850,10 @@ class RLContactPolicy(RLBasePolicy):
         use_10way_contact=False,
         use_5dim_contact_from_4dim=False,
         ref_motion_start_index=0,
+        slow_motion_end_frame=None,
+        slow_down_times=None,
     ):
-        super().__init__(onnx_model_path, obs_names)
+        super().__init__(onnx_model_path, obs_names, use_sim=use_sim)
         self.default_value = {
             "q": np.array([float(x) for x in self.meta_data["default_joint_pos"].split(",")]),
             "dq": np.zeros(29)
@@ -762,11 +880,21 @@ class RLContactPolicy(RLBasePolicy):
         else:
             self.contact_dim = 8 if use_8way_contact else 4
 
-        self.ref_motion = np.load(ref_motion_path)
+        self.ref_motion = load_ref_motion_with_optional_slowdown(
+            ref_motion_path,
+            slow_motion_end_frame=slow_motion_end_frame,
+            slow_down_times=slow_down_times,
+        )
         tlen = int(self.ref_motion["joint_pos"].shape[0])
         if contact_labels_path != "default":
             self.contact_labels = np.load(contact_labels_path, allow_pickle=True).item()
             self.contact_mask = self.contact_labels["contact_mask"].astype(np.float32)
+            #self.contact_mask[:55,2:4] = 0.0
+            self.contact_mask = stretch_contact_mask_prefix_if_enabled(
+                self.contact_mask,
+                slow_motion_end_frame=slow_motion_end_frame,
+                slow_down_times=slow_down_times,
+            )
             if self.contact_mask.ndim != 2:
                 raise ValueError(
                     f"contact_mask must be 2D (T, C), got shape {self.contact_mask.shape}"
@@ -842,12 +970,15 @@ class RLContactPolicy(RLBasePolicy):
                 )
             if zero_foot_contact_on_load and self.contact_mask.ndim == 2:
                 self.contact_mask = self.contact_mask.copy()
-                if self.use_10way_contact or use_8way_contact:
+                if self.use_10way_contact:
+                    self.contact_mask[:, 0:4] = 0.0
+                    self.contact_mask[:, 8:10] = 0.0
+                elif use_8way_contact:
                     self.contact_mask[:, 0:4] = 0.0
                 elif self.contact_mask.shape[1] >= 2:
                     self.contact_mask[:, :2] = 0.0
                 print(
-                    "[RLContactPolicy] zero_foot_contact_on_load: foot contact channels set to 0",
+                    "[RLContactPolicy] zero_foot_contact_on_load: selected contact channels set to 0",
                     flush=True,
                 )
         else:
@@ -940,7 +1071,7 @@ class RLContactPolicy(RLBasePolicy):
         control_signals["compliance"] = self.keyboard_controller.get_compliance()
         mid = self.ticker if self.ticker < self.motion_length else self.motion_length-1
         control_signals["contact_mask"] = self.contact_mask[mid]
-        print(control_signals["contact_mask"])
+        #print(control_signals["motion_anchor_pos_b"][2])
         return control_signals
 
     def prepare_obs(self, robot_state, control_signals):
@@ -979,6 +1110,7 @@ class RLStreamingContactPolicy(RLBasePolicy):
         self,
         onnx_model_path,
         obs_names,
+        use_sim=False,
         lookahead_steps=1,
         lookahead_frame_skips=1,
         hist_names=[],
@@ -992,7 +1124,7 @@ class RLStreamingContactPolicy(RLBasePolicy):
         use_5dim_contact_from_4dim=False,
         ref_motion_start_index=0,
     ):
-        super().__init__(onnx_model_path, obs_names)
+        super().__init__(onnx_model_path, obs_names, use_sim=use_sim)
         self.ref_motion_start_index = max(0, int(ref_motion_start_index))
         self._limb_contact_file_is_8way = bool(use_8way_contact)
         self.default_value = {
@@ -1278,13 +1410,15 @@ class RLStreamingContactPolicy(RLBasePolicy):
                 self._last_stream_warn_t = now
         anchor_rot_inv = Rotation.from_quat(robot_state.root_orn).inv()
         target_anchor_rot = Rotation.from_quat(self.latest_motion_anchor_orn_w)
+        error = self.latest_motion_anchor_pos_w - robot_state.root_pos
+        #error[2] = 0.0
         control_signals = {
             "lower_command": self.latest_lower_cmd.copy(),
             "vr_3point_pos": self.latest_vr_3point_pos.copy(),
             "vr_3point_ori": self.latest_vr_3point_orn.copy(),
             "contact_mask": self.latest_contact_mask.copy(),
             "compliance": self.keyboard_controller.get_compliance(),
-            "motion_anchor_pos_b": anchor_rot_inv.apply(self.latest_motion_anchor_pos_w - robot_state.root_pos).astype(np.float32),
+            "motion_anchor_pos_b": anchor_rot_inv.apply(error).astype(np.float32),
             "motion_anchor_ori_b": (anchor_rot_inv * target_anchor_rot).as_matrix()[:, :2].reshape(-1).astype(np.float32),
         }
         control_signals["projected_gravity"] = anchor_rot_inv.apply(np.array([0, 0, -1]))

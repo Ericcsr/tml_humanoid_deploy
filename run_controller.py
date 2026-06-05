@@ -14,6 +14,7 @@ from rl_policy import (
     RLGlobalCHIPPolicy,
     RLStreamingContactPolicy,
     clamp_ref_motion_start_index,
+    load_ref_motion_with_optional_slowdown,
 )
 
 from utils.params import DEFAULT_POSE, ACTION_SCALE, ISAAC_TO_MUJOCO
@@ -239,6 +240,11 @@ if __name__ == "__main__":
     else:
         has_terrain_box_multi = False
     has_terrain_box = has_terrain_box_legacy or has_terrain_box_multi
+    twc = config.get("terrain_wedges")
+    if isinstance(twc, (dict, list)):
+        has_terrain_wedge = len(twc) > 0
+    else:
+        has_terrain_wedge = False
     object_urdf = config.get("object_urdf") or ""
     object_urdf = str(object_urdf).strip() if object_urdf else ""
     object_motion = config.get("object_motion") or ""
@@ -247,11 +253,18 @@ if __name__ == "__main__":
     init_at_first_frame = bool(
         ("terrain_urdf" in config and terrain_urdf and args.use_sim)
         or (has_terrain_box and args.use_sim)
+        or (has_terrain_wedge and args.use_sim)
         or (has_object and args.use_sim)
     )
+    slow_motion_end_frame = config.get("slow_motion_end_frame", None)
+    slow_down_times = config.get("slow_down_times", None)
     _ref_for_start_index = None
     if config.get("ref_motion_path"):
-        _ref_for_start_index = np.load(config["ref_motion_path"])
+        _ref_for_start_index = load_ref_motion_with_optional_slowdown(
+            config["ref_motion_path"],
+            slow_motion_end_frame=slow_motion_end_frame,
+            slow_down_times=slow_down_times,
+        )
         config["ref_motion_start_index"] = clamp_ref_motion_start_index(
             int(config.get("ref_motion_start_index", 0)),
             int(_ref_for_start_index["joint_pos"].shape[0]),
@@ -303,10 +316,13 @@ if __name__ == "__main__":
             config["onnx_model_path"],
             config["obs_names"],
             config["ref_motion_path"],
+            use_sim=args.use_sim,
             lookahead_steps=lookahead_steps,
             lookahead_frame_skips=lookahead_frame_skips,
             init_at_first_frame=init_at_first_frame,
             ref_motion_start_index=config["ref_motion_start_index"],
+            slow_motion_end_frame=slow_motion_end_frame,
+            slow_down_times=slow_down_times,
         )
     elif config.get("use_chip", False):
         if config.get("only_3pt", False):
@@ -314,29 +330,36 @@ if __name__ == "__main__":
                 config["onnx_model_path"],
                 config["obs_names"],
                 config["ref_motion_path"],
+                use_sim=args.use_sim,
                 lookahead_steps=lookahead_steps,
                 lookahead_frame_skips=lookahead_frame_skips,
                 hist_names=config.get("history_names", []),
                 hist_length=config.get("history_length", 1),
                 init_at_first_frame=init_at_first_frame,
                 ref_motion_start_index=config["ref_motion_start_index"],
+                slow_motion_end_frame=slow_motion_end_frame,
+                slow_down_times=slow_down_times,
             )
         else:
             policy = RLCHIPPolicy(
                 config["onnx_model_path"],
                 config["obs_names"],
                 config["ref_motion_path"],
+                use_sim=args.use_sim,
                 lookahead_steps=lookahead_steps,
                 lookahead_frame_skips=lookahead_frame_skips,
                 hist_names=config.get("history_names", []),
                 hist_length=config.get("history_length", 1),
                 init_at_first_frame=init_at_first_frame,
                 ref_motion_start_index=config["ref_motion_start_index"],
+                slow_motion_end_frame=slow_motion_end_frame,
+                slow_down_times=slow_down_times,
             )                    
     elif config.get("use_streaming_motion", False):
         policy = RLStreamingContactPolicy(
             config["onnx_model_path"],
             config["obs_names"],
+            use_sim=args.use_sim,
             lookahead_steps=lookahead_steps,
             lookahead_frame_skips=lookahead_frame_skips,
             hist_names=config.get("history_names", []),
@@ -356,6 +379,7 @@ if __name__ == "__main__":
             config["obs_names"],
             config["ref_motion_path"],
             config["contact_labels_path"],
+            use_sim=args.use_sim,
             lookahead_steps=lookahead_steps,
             lookahead_frame_skips=lookahead_frame_skips,
             hist_names=config.get("history_names", []),
@@ -366,16 +390,21 @@ if __name__ == "__main__":
             use_10way_contact=config.get("use_10way_contact", False),
             use_5dim_contact_from_4dim=config.get("use_5dim_contact_from_4dim", False),
             ref_motion_start_index=config["ref_motion_start_index"],
+            slow_motion_end_frame=slow_motion_end_frame,
+            slow_down_times=slow_down_times,
         )
     else:
         policy = RLBMPolicy(
             config["onnx_model_path"],
             config["obs_names"],
             config["ref_motion_path"],
+            use_sim=args.use_sim,
             lookahead_steps=lookahead_steps,
             lookahead_frame_skips=lookahead_frame_skips,
             init_at_first_frame=init_at_first_frame,
             ref_motion_start_index=config["ref_motion_start_index"],
+            slow_motion_end_frame=slow_motion_end_frame,
+            slow_down_times=slow_down_times,
         )
 
     try:

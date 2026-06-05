@@ -9,9 +9,16 @@ single mesh collision geom is used (controller config: terrain_mesh_collision: t
 Note: MuJoCo mesh collision still uses a convex hull per mesh geom (not the column decomposition).
 
 Procedural box terrain (no URDF): use ``terrain_box_pos`` / ``terrain_box_size`` (single box) or
-``terrain_boxes`` — a dict (name -> {pos, size, rgba?, yaw? / yaw_deg?}) or a list of
-{pos, size, rgba?, name?, yaw? / yaw_deg?}; yaw is rotation about +Z through the box center (rad
-or deg). See merge_terrain_box_into_scene_xml and merge_terrain_boxes_into_scene_xml.
+``terrain_boxes`` — a dict (name -> {pos, size, rgba?, friction?, yaw? / yaw_deg?}) or a list of
+{pos, size, rgba?, friction?, name?, yaw? / yaw_deg?}; yaw is rotation about +Z through the box
+center (rad or deg). ``friction`` maps to MuJoCo geom friction [slide, torsion, roll].
+See merge_terrain_box_into_scene_xml and merge_terrain_boxes_into_scene_xml.
+
+Procedural wedge/slope terrain (no URDF): use ``terrain_wedges`` — a dict (name -> {pos, size, ...})
+or a list of {pos, size, ...}. ``pos`` is the base footprint center [x, y, z]; ``size`` is
+[run, width, rise] (or [run, width] together with ``angle``/``angle_deg``). The ramp ascends toward
+local +X before optional ``yaw``/``yaw_deg`` (about +Z). ``rgba`` and ``friction`` work as for boxes.
+See terrain_wedge_mesh_and_body_xml_fragment and merge_terrain_wedges_into_scene_xml.
 
 URDF terrain position in world: config key terrain_urdf_offset [x, y, z] (m) wraps merged terrain
 bodies in a static parent body; see merge_terrain_into_scene_from_string.
@@ -233,11 +240,21 @@ def urdf_to_mujoco_xml(
     return mesh_xml, body_xml
 
 
-def urdf_to_mujoco_object(urdf_path: str) -> Tuple[str, str]:
+def urdf_to_mujoco_object(
+    urdf_path: str,
+    use_collision_geometry: bool = True,
+    enable_collision: bool = True,
+) -> Tuple[str, str]:
     """
     Convert an object URDF (multi-link with fixed joints) to a single MuJoCo free body.
     Flattens all links into one body with freejoint. Handles box, cylinder, sphere, mesh.
     Returns body_xml string to insert into worldbody.
+
+    Args:
+        use_collision_geometry: If True, prefer <collision> geometry (fallback to <visual>).
+            If False, use <visual> geometry only and ignore <collision> entirely.
+        enable_collision: Whether generated object geoms collide (contype/conaffinity = 1/1).
+            Set False for visual-only playback assets.
     """
     urdf_path = os.path.abspath(urdf_path)
     urdf_dir = os.path.dirname(urdf_path)
@@ -302,16 +319,23 @@ def urdf_to_mujoco_object(urdf_path: str) -> Tuple[str, str]:
 
     geom_parts = []
     mesh_assets = []
+    contype = "1" if enable_collision else "0"
+    conaffinity = "1" if enable_collision else "0"
+
     for link in root_elem.findall("link"):
         link_name = link.get("name", "link")
         pos, rpy = link_to_root_transform(link_name)
         quat_str = _rpy_to_quat(rpy)
         pos_str = f"{pos[0]} {pos[1]} {pos[2]}"
 
-        geom_elems = link.findall("collision/geometry")
-        if not geom_elems:
+        if use_collision_geometry:
+            geom_elems = link.findall("collision/geometry")
+            if not geom_elems:
+                geom_elems = link.findall("visual/geometry")
+        else:
             geom_elems = link.findall("visual/geometry")
-        for geom in geom_elems:
+
+        for geom_idx, geom in enumerate(geom_elems):
             geo = geom.find("box")
             if geo is None:
                 geo = geom.find("cylinder")
@@ -331,21 +355,21 @@ def urdf_to_mujoco_object(urdf_path: str) -> Tuple[str, str]:
                 parts = size_str.split()
                 half = [float(p) / 2 for p in parts[:3]] if len(parts) >= 3 else [0.05, 0.05, 0.05]
                 geom_parts.append(
-                    f'      <geom name="object_{link_name}_{geo.tag}" type="box" pos="{pos_str}" quat="{quat_str}" '
-                    f'size="{" ".join(map(str, half))}" contype="1" conaffinity="1" rgba="{rgba}"/>'
+                    f'      <geom name="object_{link_name}_{geo.tag}_{geom_idx}" type="box" pos="{pos_str}" quat="{quat_str}" '
+                    f'size="{" ".join(map(str, half))}" contype="{contype}" conaffinity="{conaffinity}" rgba="{rgba}"/>'
                 )
             elif geo.tag == "cylinder":
                 r = float(geo.get("radius", 0.05))
                 l = float(geo.get("length", 0.1))
                 geom_parts.append(
-                    f'      <geom name="object_{link_name}_{geo.tag}" type="cylinder" pos="{pos_str}" quat="{quat_str}" '
-                    f'size="{r} {l/2}" contype="1" conaffinity="1" rgba="{rgba}"/>'
+                    f'      <geom name="object_{link_name}_{geo.tag}_{geom_idx}" type="cylinder" pos="{pos_str}" quat="{quat_str}" '
+                    f'size="{r} {l/2}" contype="{contype}" conaffinity="{conaffinity}" rgba="{rgba}"/>'
                 )
             elif geo.tag == "sphere":
                 r = float(geo.get("radius", 0.05))
                 geom_parts.append(
-                    f'      <geom name="object_{link_name}_{geo.tag}" type="sphere" pos="{pos_str}" quat="{quat_str}" '
-                    f'size="{r}" contype="1" conaffinity="1" rgba="{rgba}"/>'
+                    f'      <geom name="object_{link_name}_{geo.tag}_{geom_idx}" type="sphere" pos="{pos_str}" quat="{quat_str}" '
+                    f'size="{r}" contype="{contype}" conaffinity="{conaffinity}" rgba="{rgba}"/>'
                 )
             elif geo.tag == "mesh":
                 filename = geo.get("filename")
@@ -355,11 +379,11 @@ def urdf_to_mujoco_object(urdf_path: str) -> Tuple[str, str]:
                 scale_parts = scale_str.split()
                 scale = " ".join(scale_parts[:3]) if len(scale_parts) >= 3 else "1 1 1"
                 mesh_path = os.path.normpath(os.path.join(urdf_dir, filename)).replace("\\", "/")
-                mesh_name = f"object_mesh_{link_name}".replace(" ", "_")
+                mesh_name = f"object_mesh_{link_name}_{geom_idx}".replace(" ", "_")
                 mesh_assets.append(f'    <mesh name="{mesh_name}" file="{mesh_path}" scale="{scale}"/>')
                 geom_parts.append(
-                    f'      <geom name="object_{link_name}_mesh" type="mesh" pos="{pos_str}" quat="{quat_str}" '
-                    f'mesh="{mesh_name}" contype="1" conaffinity="1" rgba="{rgba}"/>'
+                    f'      <geom name="object_{link_name}_mesh_{geom_idx}" type="mesh" pos="{pos_str}" quat="{quat_str}" '
+                    f'mesh="{mesh_name}" contype="{contype}" conaffinity="{conaffinity}" rgba="{rgba}"/>'
                 )
 
     if not geom_parts:
@@ -376,12 +400,21 @@ def urdf_to_mujoco_object(urdf_path: str) -> Tuple[str, str]:
     return body_xml, asset_xml
 
 
-def merge_object_into_scene(scene_xml: str, object_urdf_path: str) -> str:
+def merge_object_into_scene(
+    scene_xml: str,
+    object_urdf_path: str,
+    use_collision_geometry: bool = True,
+    enable_collision: bool = True,
+) -> str:
     """
     Merge a floating object from URDF into the scene (at end of worldbody).
     Object is added LAST so robot qpos/qvel indices (0-35, 0-34) stay unchanged.
     """
-    body_xml, asset_xml = urdf_to_mujoco_object(object_urdf_path)
+    body_xml, asset_xml = urdf_to_mujoco_object(
+        object_urdf_path,
+        use_collision_geometry=use_collision_geometry,
+        enable_collision=enable_collision,
+    )
     if not body_xml:
         return scene_xml
 
@@ -442,6 +475,7 @@ def terrain_box_body_xml_fragment(
     pos_xyz: Tuple[float, float, float],
     size_xyz: Tuple[float, float, float],
     rgba: Tuple[float, float, float, float] = (0.55, 0.52, 0.48, 1.0),
+    friction: Optional[Tuple[float, float, float]] = None,
     body_name: str = "terrain_box",
     yaw_rad: float = 0.0,
 ) -> str:
@@ -457,10 +491,15 @@ def terrain_box_body_xml_fragment(
     px, py, pz = float(pos_xyz[0]), float(pos_xyz[1]), float(pos_xyz[2])
     r, g, b, a = float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3])
     qw, qx, qy, qz = _yaw_about_z_to_mujoco_quat_wxyz(yaw_rad)
+    if friction is not None:
+        f1, f2, f3 = float(friction[0]), float(friction[1]), float(friction[2])
+        friction_attr = f' friction="{f1} {f2} {f3}"'
+    else:
+        friction_attr = ""
     return (
         f'    <body name="{bname}" pos="{px} {py} {pz}" quat="{qw} {qx} {qy} {qz}">\n'
         f'      <geom name="{bname}_geom" type="box" pos="0 0 0" size="{hx} {hy} {hz}" '
-        f'contype="1" conaffinity="1" rgba="{r} {g} {b} {a}"/>\n'
+        f'contype="1" conaffinity="1" rgba="{r} {g} {b} {a}"{friction_attr}/>\n'
         f"    </body>"
     )
 
@@ -473,18 +512,20 @@ def merge_terrain_boxes_into_scene_xml(
             Tuple[float, float, float],
             Tuple[float, float, float],
             Optional[Tuple[float, float, float, float]],
+            Optional[Tuple[float, float, float]],
             float,
         ]
     ],
     default_rgba: Tuple[float, float, float, float] = (0.55, 0.52, 0.48, 1.0),
+    default_friction: Optional[Tuple[float, float, float]] = None,
 ) -> str:
     """
     Insert several static box bodies (one fragment, order preserved: first in ``boxes`` is first
     in worldbody after ``<worldbody>``).
 
-    Each tuple is (label_for_body_name, pos_xyz, size_xyz, rgba_or_none, yaw_rad). Body names are
-    sanitized; geom names are ``{body}_geom``. ``yaw_rad`` is rotation about +Z through the box
-    center (0 = axis-aligned with world).
+    Each tuple is (label_for_body_name, pos_xyz, size_xyz, rgba_or_none, friction_or_none, yaw_rad).
+    Body names are sanitized; geom names are ``{body}_geom``. ``yaw_rad`` is rotation about +Z
+    through the box center (0 = axis-aligned with world).
 
     If ``boxes`` is empty, returns ``scene_xml`` unchanged.
     """
@@ -492,7 +533,7 @@ def merge_terrain_boxes_into_scene_xml(
         return scene_xml
     parts: List[str] = []
     used: set = set()
-    for label, pos_xyz, size_xyz, rgba, yaw_rad in boxes:
+    for label, pos_xyz, size_xyz, rgba, friction, yaw_rad in boxes:
         bname = _sanitize_terrain_box_body_name(label)
         if bname in used:
             raise ValueError(f"Duplicate terrain box body name after sanitize: {bname!r} (from {label!r})")
@@ -500,8 +541,18 @@ def merge_terrain_boxes_into_scene_xml(
         rgba_t = default_rgba if rgba is None else rgba
         if len(rgba_t) != 4:
             raise ValueError("each terrain box rgba must be length-4 [r,g,b,a]")
+        friction_t = default_friction if friction is None else friction
+        if friction_t is not None and len(friction_t) != 3:
+            raise ValueError("each terrain box friction must be length-3 [slide, torsion, roll]")
         parts.append(
-            terrain_box_body_xml_fragment(pos_xyz, size_xyz, rgba_t, body_name=label, yaw_rad=yaw_rad)
+            terrain_box_body_xml_fragment(
+                pos_xyz,
+                size_xyz,
+                rgba_t,
+                friction_t,
+                body_name=label,
+                yaw_rad=yaw_rad,
+            )
         )
     return _insert_after_worldbody_open(scene_xml, "\n".join(parts))
 
@@ -511,6 +562,7 @@ def merge_terrain_box_into_scene_xml(
     pos_xyz: Tuple[float, float, float],
     size_xyz: Tuple[float, float, float],
     rgba: Tuple[float, float, float, float] = (0.55, 0.52, 0.48, 1.0),
+    friction: Optional[Tuple[float, float, float]] = None,
     yaw_rad: float = 0.0,
 ) -> str:
     """
@@ -520,13 +572,132 @@ def merge_terrain_box_into_scene_xml(
         pos_xyz: World position of the box center (m).
         size_xyz: Full outer dimensions (lx, ly, lz) in meters; converted to MuJoCo half-sizes.
         rgba: Visual/collision rgba (alpha only affects visualization).
+        friction: Optional MuJoCo geom friction [slide, torsion, roll].
         yaw_rad: Rotation about +Z (rad) through the box center.
 
     The body is named ``terrain_box``; geom ``terrain_box_geom`` (see terrain_box_body_xml_fragment).
     """
     return merge_terrain_boxes_into_scene_xml(
-        scene_xml, [("terrain_box", pos_xyz, size_xyz, rgba, yaw_rad)]
+        scene_xml, [("terrain_box", pos_xyz, size_xyz, rgba, friction, yaw_rad)]
     )
+
+
+def _insert_meshes_into_asset(scene_xml: str, mesh_xml: str) -> str:
+    """Insert ``<mesh .../>`` asset fragment into the scene's ``<asset>`` (create it if absent)."""
+    if not mesh_xml:
+        return scene_xml
+    if "<asset>" in scene_xml and "</asset>" in scene_xml:
+        return scene_xml.replace("</asset>", "\n" + mesh_xml + "\n  </asset>", 1)
+    insert = f"  <asset>\n{mesh_xml}\n  </asset>\n  "
+    return scene_xml.replace("<worldbody>", insert + "<worldbody>", 1)
+
+
+def terrain_wedge_mesh_and_body_xml_fragment(
+    pos_xyz: Tuple[float, float, float],
+    size_xyz: Tuple[float, float, float],
+    rgba: Tuple[float, float, float, float] = (0.55, 0.52, 0.48, 1.0),
+    friction: Optional[Tuple[float, float, float]] = None,
+    body_name: str = "terrain_wedge",
+    yaw_rad: float = 0.0,
+) -> Tuple[str, str]:
+    """
+    Build one static triangular-prism wedge (a ramp/slope) as ``(mesh_asset_xml, body_xml)``.
+
+    The wedge rests on the ground: ``pos_xyz`` is the center of the rectangular base
+    footprint, so its z should be the floor height (typically 0). ``size_xyz`` is
+    ``(run, width, rise)``: the ramp climbs from z=0 at the low edge to ``rise`` at the
+    high edge over a horizontal ``run``, extruded by ``width``. Before ``yaw_rad`` the
+    slope ascends toward local +X. Slope angle = ``atan(rise / run)``.
+
+    The mesh is named ``{body_name}_mesh``; body ``{body_name}``; geom ``{body_name}_geom``.
+    MuJoCo builds the convex hull of the 6 vertices for collision/visualization.
+    """
+    bname = _sanitize_terrain_box_body_name(body_name)
+    mesh_name = f"{bname}_mesh"
+    hx = float(size_xyz[0]) / 2.0
+    hy = float(size_xyz[1]) / 2.0
+    rise = float(size_xyz[2])
+    px, py, pz = float(pos_xyz[0]), float(pos_xyz[1]), float(pos_xyz[2])
+    r, g, b, a = float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3])
+    qw, qx, qy, qz = _yaw_about_z_to_mujoco_quat_wxyz(yaw_rad)
+    # Triangular prism: base rectangle at z=0 plus a high edge at +X, z=rise.
+    verts = (
+        (-hx, -hy, 0.0),
+        (hx, -hy, 0.0),
+        (hx, hy, 0.0),
+        (-hx, hy, 0.0),
+        (hx, -hy, rise),
+        (hx, hy, rise),
+    )
+    vertex_str = " ".join(f"{vx:g} {vy:g} {vz:g}" for vx, vy, vz in verts)
+    if friction is not None:
+        f1, f2, f3 = float(friction[0]), float(friction[1]), float(friction[2])
+        friction_attr = f' friction="{f1} {f2} {f3}"'
+    else:
+        friction_attr = ""
+    mesh_xml = f'    <mesh name="{mesh_name}" vertex="{vertex_str}"/>'
+    body_xml = (
+        f'    <body name="{bname}" pos="{px} {py} {pz}" quat="{qw} {qx} {qy} {qz}">\n'
+        f'      <geom name="{bname}_geom" type="mesh" mesh="{mesh_name}" pos="0 0 0" '
+        f'contype="1" conaffinity="1" rgba="{r} {g} {b} {a}"{friction_attr}/>\n'
+        f"    </body>"
+    )
+    return mesh_xml, body_xml
+
+
+def merge_terrain_wedges_into_scene_xml(
+    scene_xml: str,
+    wedges: List[
+        Tuple[
+            str,
+            Tuple[float, float, float],
+            Tuple[float, float, float],
+            Optional[Tuple[float, float, float, float]],
+            Optional[Tuple[float, float, float]],
+            float,
+        ]
+    ],
+    default_rgba: Tuple[float, float, float, float] = (0.55, 0.52, 0.48, 1.0),
+    default_friction: Optional[Tuple[float, float, float]] = None,
+) -> str:
+    """
+    Insert several static wedge (ramp/slope) bodies plus their convex-hull mesh assets.
+
+    Each tuple is ``(label_for_body_name, pos_xyz, size_xyz, rgba_or_none,
+    friction_or_none, yaw_rad)`` where ``size_xyz`` = ``(run, width, rise)`` and
+    ``pos_xyz`` is the base footprint center. Body names are sanitized; meshes are
+    ``{body}_mesh`` and geoms ``{body}_geom``.
+
+    If ``wedges`` is empty, returns ``scene_xml`` unchanged.
+    """
+    if not wedges:
+        return scene_xml
+    mesh_parts: List[str] = []
+    body_parts: List[str] = []
+    used: set = set()
+    for label, pos_xyz, size_xyz, rgba, friction, yaw_rad in wedges:
+        bname = _sanitize_terrain_box_body_name(label)
+        if bname in used:
+            raise ValueError(f"Duplicate terrain wedge body name after sanitize: {bname!r} (from {label!r})")
+        used.add(bname)
+        rgba_t = default_rgba if rgba is None else rgba
+        if len(rgba_t) != 4:
+            raise ValueError("each terrain wedge rgba must be length-4 [r,g,b,a]")
+        friction_t = default_friction if friction is None else friction
+        if friction_t is not None and len(friction_t) != 3:
+            raise ValueError("each terrain wedge friction must be length-3 [slide, torsion, roll]")
+        mesh_xml, body_xml = terrain_wedge_mesh_and_body_xml_fragment(
+            pos_xyz,
+            size_xyz,
+            rgba_t,
+            friction_t,
+            body_name=label,
+            yaw_rad=yaw_rad,
+        )
+        mesh_parts.append(mesh_xml)
+        body_parts.append(body_xml)
+    scene_xml = _insert_meshes_into_asset(scene_xml, "\n".join(mesh_parts))
+    return _insert_after_worldbody_open(scene_xml, "\n".join(body_parts))
 
 
 def merge_free_box_into_scene_xml(

@@ -18,6 +18,7 @@ import numpy as np
 from utils.robot_utils import Rate
 from utils.robot_model import KinematicsModel
 from utils.redis_utils import REDIS_IP, REDIS_PORT
+from utils.ros_root_pose_pub import RootPoseRosPublisher
 
 
 def _to_vec(data: Any, size: int, name: str) -> np.ndarray:
@@ -33,19 +34,19 @@ parser = ArgumentParser(
 parser.add_argument(
     "--root_pos_topic",
     type=str,
-    default="root_pos",
+    default="mocap_root_pos",
     help="Redis key that stores pickled root position.",
 )
 parser.add_argument(
     "--root_quat_topic",
     type=str,
-    default="root_quat",
+    default="mocap_root_quat",
     help="Redis key that stores pickled root quaternion (xyzw).",
 )
 parser.add_argument(
     "--root_lin_vel_topic",
     type=str,
-    default="root_lin_vel",
+    default="mocap_root_lin_vel",
     help="Redis key that stores pickled root linear velocity.",
 )
 parser.add_argument(
@@ -78,6 +79,18 @@ parser.add_argument(
     default=1.0,
     help="Slow down loop by this factor.",
 )
+parser.add_argument(
+    "--ros_pub",
+    action="store_true",
+    default=False,
+    help="Publish root pose and body-frame velocity on /root_pose_mocap (nav_msgs/Odometry).",
+)
+parser.add_argument(
+    "--no_redis_root_data",
+    action="store_true",
+    default=False,
+    help="Do not publish packed root_data to Redis (still reads mocap keys).",
+)
 args = parser.parse_args()
 
 kin_model = KinematicsModel(
@@ -97,6 +110,20 @@ rate = Rate(base_hz / args.slow_down)
 if args.slow_down != 1.0:
     print(f"[run_state_estimation_mocap] Slow down: {args.slow_down}x", flush=True)
 
+ros_pub = None
+if args.ros_pub:
+    ros_pub = RootPoseRosPublisher(
+        topic="/root_pose_mocap",
+        node_name="run_state_estimation_mocap",
+    )
+    print("[run_state_estimation_mocap] ROS publish enabled: /root_pose_mocap", flush=True)
+if args.no_redis_root_data:
+    print(
+        f"[run_state_estimation_mocap] Redis root_data publish disabled "
+        f"(skipping {args.root_data_topic})",
+        flush=True,
+    )
+
 last_q = np.zeros(29, dtype=np.float32)
 
 while True:
@@ -109,9 +136,9 @@ while True:
         continue
 
     try:
-        root_pos = _to_vec(pickle.loads(root_pos_raw), 3, "root_pos")
-        root_quat = _to_vec(pickle.loads(root_quat_raw), 4, "root_quat")
-        root_lin_vel = _to_vec(pickle.loads(root_lin_vel_raw), 3, "root_lin_vel")
+        root_pos = _to_vec(pickle.loads(root_pos_raw), 3, "mocap_root_pos")
+        root_quat = _to_vec(pickle.loads(root_quat_raw), 4, "mocap_root_quat")
+        root_lin_vel = _to_vec(pickle.loads(root_lin_vel_raw), 3, "mocap_root_lin_vel")
     except Exception as exc:
         print(
             "[run_state_estimation_mocap] Failed to parse mocap Redis keys "
@@ -121,8 +148,12 @@ while True:
         rate.sleep()
         continue
 
-    root_data = np.hstack((root_pos, root_quat, root_lin_vel))
-    redis_client.set(args.root_data_topic, pickle.dumps(root_data))
+    if not args.no_redis_root_data:
+        root_data = np.hstack((root_pos, root_quat, root_lin_vel))
+        redis_client.set(args.root_data_topic, pickle.dumps(root_data))
+
+    if ros_pub is not None:
+        ros_pub.publish(root_pos, root_quat, root_lin_vel)
 
     if args.visualize:
         proprio_raw = redis_client.get(args.proprio_topic)

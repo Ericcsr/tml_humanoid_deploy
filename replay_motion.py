@@ -63,8 +63,10 @@ if "wrist_grasp_label" in motion.keys():
     has_grasp_label = True
 
 motion_length = motion["joint_pos"].shape[0]
+num_keypoints = int(motion["body_pos_w"].shape[1])
 
 print("Motion length:", motion_length)
+print("Body keypoints:", num_keypoints)
 
 fps = 50#float(motion["fps"])
 
@@ -75,10 +77,36 @@ all_links = [pb.getJointInfo(robot, i)[12].decode("utf-8") for i in range(pb.get
 hand_names = ["left_rubber_hand", "right_rubber_hand"]
 hand_ids = [all_links.index(name) for name in hand_names]
 
+# Visualize all body_pos_w keypoints as small persistent spheres.
+keypoint_marker_ids = []
+for kp_idx in range(num_keypoints):
+    t = 0.0 if num_keypoints <= 1 else kp_idx / float(num_keypoints - 1)
+    rgba = [1.0 - t, 0.2, t, 0.85]
+    vis_id = pb.createVisualShape(
+        pb.GEOM_SPHERE,
+        radius=0.02,
+        rgbaColor=rgba,
+    )
+    marker_id = pb.createMultiBody(
+        baseMass=0.0,
+        baseCollisionShapeIndex=-1,
+        baseVisualShapeIndex=vis_id,
+        basePosition=[0.0, 0.0, -10.0],
+        baseOrientation=[0.0, 0.0, 0.0, 1.0],
+    )
+    keypoint_marker_ids.append(marker_id)
+
 while True:
     for i in range(motion_length):
         joint_pos = motion["joint_pos"][i]
         set_joint_angles(robot, joint_pos[ISAAC_TO_MUJOCO])
+        rel_keypoints = init_root_heading.inv().apply(motion["body_pos_w"][i] - init_root_pos)
+        for kp_idx, marker_id in enumerate(keypoint_marker_ids):
+            pb.resetBasePositionAndOrientation(
+                marker_id,
+                rel_keypoints[kp_idx],
+                [0.0, 0.0, 0.0, 1.0],
+            )
         rel_root_pos = init_root_heading.inv().apply(motion["body_pos_w"][i,0] - init_root_pos)
         rel_root_orn = (init_root_heading.inv() * Rotation.from_quat(motion["body_quat_w"][i,0][[1,2,3,0]])).as_quat()
         if has_grasp_label: # draw sphere around wrist if grasp label is true

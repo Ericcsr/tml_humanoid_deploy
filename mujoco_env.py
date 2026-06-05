@@ -471,6 +471,14 @@ class MujocoRobot:
                 "Use either terrain_box_pos/terrain_box_size (single box) or terrain_boxes, not both"
             )
         has_terrain_box = has_terrain_box_legacy or has_terrain_box_multi
+        terrain_wedges_cfg = config.get("terrain_wedges")
+        has_terrain_wedge = False
+        if isinstance(terrain_wedges_cfg, dict):
+            has_terrain_wedge = len(terrain_wedges_cfg) > 0
+        elif isinstance(terrain_wedges_cfg, list):
+            has_terrain_wedge = len(terrain_wedges_cfg) > 0
+        elif terrain_wedges_cfg is not None:
+            raise TypeError("terrain_wedges must be a dict, a list, or omitted")
         fb_pos = config.get("free_box_pos")
         fb_size = config.get("free_box_size")
         has_free_box = fb_pos is not None and fb_size is not None
@@ -495,7 +503,25 @@ class MujocoRobot:
                     return float(spec["yaw"])
                 return 0.0
 
+            def _terrain_friction_from_value(value, ctx: str):
+                if value is None:
+                    return None
+                if isinstance(value, (list, tuple)):
+                    friction_t = tuple(float(x) for x in value)
+                    if len(friction_t) != 3:
+                        raise ValueError(f"{ctx}: friction must be scalar or length-3 [slide, torsion, roll]")
+                else:
+                    f = float(value)
+                    friction_t = (f, f, f)
+                if min(friction_t) < 0.0:
+                    raise ValueError(f"{ctx}: friction values must be >= 0")
+                return friction_t
+
             default_rgba = (0.55, 0.52, 0.48, 1.0)
+            default_friction = _terrain_friction_from_value(
+                config.get("terrain_boxes_friction", config.get("terrain_box_friction")),
+                "terrain_boxes_friction",
+            )
             boxes: list = []
             if isinstance(terrain_boxes_cfg, dict):
                 for name, spec in terrain_boxes_cfg.items():
@@ -527,7 +553,10 @@ class MujocoRobot:
                     else:
                         rgba_t = None
                     yaw_t = _terrain_yaw_from_spec(spec, f"terrain_boxes[{name!r}]")
-                    boxes.append((str(name), pos_t, size_t, rgba_t, yaw_t))
+                    friction_t = _terrain_friction_from_value(
+                        spec.get("friction", None), f"terrain_boxes[{name!r}]"
+                    )
+                    boxes.append((str(name), pos_t, size_t, rgba_t, friction_t, yaw_t))
             else:
                 for i, spec in enumerate(terrain_boxes_cfg):
                     if not isinstance(spec, dict):
@@ -559,9 +588,17 @@ class MujocoRobot:
                         rgba_t = None
                     name = spec.get("name", f"box_{i}")
                     yaw_t = _terrain_yaw_from_spec(spec, f"terrain_boxes[{i}]")
-                    boxes.append((str(name), pos_t, size_t, rgba_t, yaw_t))
+                    friction_t = _terrain_friction_from_value(
+                        spec.get("friction", None), f"terrain_boxes[{i}]"
+                    )
+                    boxes.append((str(name), pos_t, size_t, rgba_t, friction_t, yaw_t))
 
-            scene_xml = merge_terrain_boxes_into_scene_xml(scene_xml, boxes, default_rgba=default_rgba)
+            scene_xml = merge_terrain_boxes_into_scene_xml(
+                scene_xml,
+                boxes,
+                default_rgba=default_rgba,
+                default_friction=default_friction,
+            )
             scene_dirty = True
             print(
                 f"[MujocoRobot] Procedural terrain boxes: {len(boxes)} (terrain_boxes)",
@@ -589,16 +626,149 @@ class MujocoRobot:
             else:
                 yaw_t = 0.0
             tb_rgba = config.get("terrain_box_rgba")
+            tb_friction = config.get("terrain_box_friction")
+            if isinstance(tb_friction, (list, tuple)):
+                tb_friction_t = tuple(float(x) for x in tb_friction)
+                if len(tb_friction_t) != 3:
+                    raise ValueError(
+                        "terrain_box_friction must be scalar or length-3 [slide, torsion, roll]"
+                    )
+            elif tb_friction is not None:
+                f = float(tb_friction)
+                tb_friction_t = (f, f, f)
+            else:
+                tb_friction_t = None
+            if tb_friction_t is not None and min(tb_friction_t) < 0.0:
+                raise ValueError("terrain_box_friction values must be >= 0")
             if tb_rgba is not None:
                 rgba_t = tuple(float(x) for x in tb_rgba)
                 if len(rgba_t) != 4:
                     raise ValueError("terrain_box_rgba must be length-4 [r,g,b,a]")
-                scene_xml = merge_terrain_box_into_scene_xml(scene_xml, pos_t, size_t, rgba_t, yaw_t)
+                scene_xml = merge_terrain_box_into_scene_xml(
+                    scene_xml,
+                    pos_t,
+                    size_t,
+                    rgba_t,
+                    friction=tb_friction_t,
+                    yaw_rad=yaw_t,
+                )
             else:
-                scene_xml = merge_terrain_box_into_scene_xml(scene_xml, pos_t, size_t, yaw_rad=yaw_t)
+                scene_xml = merge_terrain_box_into_scene_xml(
+                    scene_xml,
+                    pos_t,
+                    size_t,
+                    friction=tb_friction_t,
+                    yaw_rad=yaw_t,
+                )
             scene_dirty = True
             print(
                 f"[MujocoRobot] Procedural terrain box center={pos_t} full_size={size_t} (m)",
+                flush=True,
+            )
+
+        if has_terrain_wedge:
+            from utils.urdf_to_mujoco import merge_terrain_wedges_into_scene_xml
+            import math
+
+            def _wedge_yaw_from_spec(spec: dict, ctx: str) -> float:
+                has_yaw = "yaw" in spec
+                has_yaw_deg = "yaw_deg" in spec
+                if has_yaw and has_yaw_deg:
+                    raise ValueError(f"{ctx}: use only one of yaw (radians) or yaw_deg")
+                if has_yaw_deg:
+                    return math.radians(float(spec["yaw_deg"]))
+                if has_yaw:
+                    return float(spec["yaw"])
+                return 0.0
+
+            def _wedge_friction_from_value(value, ctx: str):
+                if value is None:
+                    return None
+                if isinstance(value, (list, tuple)):
+                    friction_t = tuple(float(x) for x in value)
+                    if len(friction_t) != 3:
+                        raise ValueError(f"{ctx}: friction must be scalar or length-3 [slide, torsion, roll]")
+                else:
+                    f = float(value)
+                    friction_t = (f, f, f)
+                if min(friction_t) < 0.0:
+                    raise ValueError(f"{ctx}: friction values must be >= 0")
+                return friction_t
+
+            def _wedge_size_from_spec(spec: dict, ctx: str):
+                size_ = spec.get("size")
+                if size_ is None:
+                    raise ValueError(
+                        f"{ctx} must include size [run, width, rise] (or [run, width] with angle/angle_deg)"
+                    )
+                size_t = tuple(float(x) for x in size_)
+                has_angle = "angle" in spec or "angle_deg" in spec
+                if "angle" in spec and "angle_deg" in spec:
+                    raise ValueError(f"{ctx}: use only one of angle (radians) or angle_deg")
+                if len(size_t) == 2:
+                    if not has_angle:
+                        raise ValueError(f"{ctx}: size length-2 [run, width] requires angle or angle_deg")
+                    run, width = size_t
+                    angle = (
+                        math.radians(float(spec["angle_deg"]))
+                        if "angle_deg" in spec
+                        else float(spec["angle"])
+                    )
+                    size_t = (run, width, run * math.tan(angle))
+                elif len(size_t) == 3:
+                    if has_angle:
+                        raise ValueError(
+                            f"{ctx}: provide rise via size[2] OR angle/angle_deg, not both"
+                        )
+                else:
+                    raise ValueError(
+                        f"{ctx}: size must be length-3 [run, width, rise] or length-2 [run, width]"
+                    )
+                if min(size_t) <= 0:
+                    raise ValueError(f"{ctx}: run, width, and rise must be positive")
+                return size_t
+
+            default_rgba = (0.55, 0.52, 0.48, 1.0)
+            default_friction = _wedge_friction_from_value(
+                config.get("terrain_wedges_friction", config.get("terrain_wedge_friction")),
+                "terrain_wedges_friction",
+            )
+            if isinstance(terrain_wedges_cfg, dict):
+                wedge_iter = list(terrain_wedges_cfg.items())
+            else:
+                wedge_iter = [(f"wedge_{i}", v) for i, v in enumerate(terrain_wedges_cfg)]
+            wedges: list = []
+            for name, spec in wedge_iter:
+                ctx = f"terrain_wedges[{name!r}]"
+                if not isinstance(spec, dict):
+                    raise TypeError(f"{ctx} must be a dict with pos, size, ...")
+                pos_ = spec.get("pos")
+                if pos_ is None:
+                    raise ValueError(f"{ctx} must include pos [x, y, z] (base footprint center)")
+                pos_t = tuple(float(x) for x in pos_)
+                if len(pos_t) != 3:
+                    raise ValueError(f"{ctx}: pos must be length-3 [x, y, z]")
+                size_t = _wedge_size_from_spec(spec, ctx)
+                rgba_ = spec.get("rgba")
+                if rgba_ is not None:
+                    rgba_t = tuple(float(x) for x in rgba_)
+                    if len(rgba_t) != 4:
+                        raise ValueError(f"{ctx}: rgba must be length-4 [r,g,b,a]")
+                else:
+                    rgba_t = None
+                yaw_t = _wedge_yaw_from_spec(spec, ctx)
+                friction_t = _wedge_friction_from_value(spec.get("friction"), ctx)
+                wedges.append((str(spec.get("name", name)), pos_t, size_t, rgba_t, friction_t, yaw_t))
+
+            scene_xml = merge_terrain_wedges_into_scene_xml(
+                scene_xml,
+                wedges,
+                default_rgba=default_rgba,
+                default_friction=default_friction,
+            )
+            scene_dirty = True
+            print(
+                f"[MujocoRobot] Procedural terrain wedges: {len(wedges)} (terrain_wedges)",
                 flush=True,
             )
 
@@ -701,6 +871,8 @@ class MujocoRobot:
                 )
             if has_terrain_box:
                 msg += "  Check terrain_box_pos / terrain_box_size or terrain_boxes and scene XML.\n"
+            if has_terrain_wedge:
+                msg += "  Check terrain_wedges (pos, size [run, width, rise]) and scene XML.\n"
             if has_free_box:
                 msg += "  Check free_box_pos / free_box_size / free_box_mass and scene XML.\n"
             raise RuntimeError(msg) from e

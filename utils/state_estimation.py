@@ -586,13 +586,16 @@ class QuaternionCollaborativeFilterSimple:
 
         self._initialized = True
 
-    def update(self, q_imu, q_slam):
+    def update(self, q_imu, q_slam, imu_only=False):
         q_imu = _q_norm(q_imu)
         q_slam = _q_norm(q_slam)
         self._maybe_init(q_imu, q_slam)
 
         # IMU & SLAM relative to origin
         q_i_rel = _q_mul(_q_inv(self._q_origin), q_imu)
+        if imu_only:
+            return q_i_rel.copy()
+
         q_s_in_imu = _q_mul(self._q_extr_slam_to_imu, q_slam)
         q_s_rel = _q_mul(_q_inv(self._q_origin), q_s_in_imu)
 
