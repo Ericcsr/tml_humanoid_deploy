@@ -1,6 +1,16 @@
 import numpy as np
 import onnxruntime
 import torch
+# torch (libgomp) eagerly creates a thread pool sized to nproc on import. On a
+# 192-thread box this means ~96 idle worker threads per process, all in R state
+# even when torch is never called. Cap to 1 to avoid this — torch is currently
+# only imported as dead code in this stack but kept for future use.
+torch.set_num_threads(1)
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    # Already set by an earlier importer in the same process; ignore.
+    pass
 import time
 import pickle
 import redis
@@ -117,11 +127,17 @@ def stretch_contact_mask_prefix_if_enabled(
     return stretched
 
 
-def expand_4way_contact_to_8(m4: np.ndarray) -> np.ndarray:
+def expand_4way_contact_to_8(
+    m4: np.ndarray,
+    *,
+    wrist_contact_as_env: bool = False,
+) -> np.ndarray:
     """
     4-way [Lfoot, Rfoot, Lwrist, Rwrist] -> 8-way
     [Lfoot_env, Lfoot_obj, Rfoot_env, Rfoot_obj, Lwrist_env, Lwrist_obj, Rwrist_env, Rwrist_obj]
-    Default split: foot values -> env; wrist values -> object; the paired channel is 0.
+
+    Default (wrist_contact_as_env=False): feet -> env; wrists -> object (object-manipulation style).
+    wrist_contact_as_env=True: wrists -> env (terrain / ladder climbing, matches training on terrain motions).
     """
     m4 = np.asarray(m4, dtype=np.float32)
     lead = m4.ndim - 1
@@ -131,12 +147,20 @@ def expand_4way_contact_to_8(m4: np.ndarray) -> np.ndarray:
     m8 = np.zeros(m4.shape[:lead] + (8,), dtype=np.float32)
     m8[sl + (0,)] = m4[sl + (0,)]
     m8[sl + (2,)] = m4[sl + (1,)]
-    m8[sl + (5,)] = m4[sl + (2,)]
-    m8[sl + (7,)] = m4[sl + (3,)]
+    if wrist_contact_as_env:
+        m8[sl + (4,)] = m4[sl + (2,)]
+        m8[sl + (6,)] = m4[sl + (3,)]
+    else:
+        m8[sl + (5,)] = m4[sl + (2,)]
+        m8[sl + (7,)] = m4[sl + (3,)]
     return m8
 
 
-def expand_5way_contact_to_10(m5: np.ndarray) -> np.ndarray:
+def expand_5way_contact_to_10(
+    m5: np.ndarray,
+    *,
+    wrist_contact_as_env: bool = False,
+) -> np.ndarray:
     """
     5-way stored labels -> 10-way obs: 4-way [Lfoot, Rfoot, Lwrist, Rwrist] expanded to 8-way,
     then 2-way pelvis/seat [env, obj] appended (column 4 -> env; obj channel 0), same split
@@ -149,7 +173,7 @@ def expand_5way_contact_to_10(m5: np.ndarray) -> np.ndarray:
     sl = (slice(None),) * lead
     m4 = m5[sl + (slice(0, 4),)].copy()
     seat = m5[sl + (4,)]
-    m8 = expand_4way_contact_to_8(m4)
+    m8 = expand_4way_contact_to_8(m4, wrist_contact_as_env=wrist_contact_as_env)
     m10 = np.zeros(m5.shape[:lead] + (10,), dtype=np.float32)
     m10[sl + (slice(0, 8),)] = m8
     m10[sl + (8,)] = seat
@@ -167,9 +191,15 @@ def pad_4way_contact_to_5(m4: np.ndarray) -> np.ndarray:
     return np.concatenate([m4, z], axis=lead)
 
 
-def expand_4way_limb_to_10way_with_zero_seat(m4: np.ndarray) -> np.ndarray:
+def expand_4way_limb_to_10way_with_zero_seat(
+    m4: np.ndarray,
+    *,
+    wrist_contact_as_env: bool = False,
+) -> np.ndarray:
     """(..., 4) 4-way limbs -> (..., 10): 8-way limb channels + [0, 0] pelvis/seat (2-way)."""
-    m8 = expand_4way_contact_to_8(np.asarray(m4, dtype=np.float32))
+    m8 = expand_4way_contact_to_8(
+        np.asarray(m4, dtype=np.float32), wrist_contact_as_env=wrist_contact_as_env
+    )
     lead = m8.ndim - 1
     z2 = np.zeros(m8.shape[:lead] + (2,), dtype=np.float32)
     return np.concatenate([m8, z2], axis=lead)
@@ -192,10 +222,27 @@ def reduce_8way_contact_to_4(m8: np.ndarray) -> np.ndarray:
     return m4
 
 
+def zero_hand_contact_channels(mask: np.ndarray, *, contact_dim: int) -> np.ndarray:
+    """Zero L/R wrist channels in the final deploy contact layout (4/5- or 8/10-way)."""
+    out = np.asarray(mask, dtype=np.float32).copy()
+    if out.ndim == 1:
+        if contact_dim in (4, 5) and out.size >= 4:
+            out[2:4] = 0.0
+        elif contact_dim in (8, 10) and out.size >= 8:
+            out[4:8] = 0.0
+        return out
+    if contact_dim in (4, 5):
+        out[..., 2:4] = 0.0
+    elif contact_dim in (8, 10):
+        out[..., 4:8] = 0.0
+    return out
+
+
 def normalize_contact_mask_labels(
     raw: np.ndarray,
     *,
     use_8way_contact: bool,
+    wrist_contact_as_env: bool = False,
 ) -> np.ndarray:
     """
     Load (T,4) or (T,8) to match deploy mode: 4-way policy vs 8-way.
@@ -209,7 +256,7 @@ def normalize_contact_mask_labels(
         if c == 8:
             return raw
         if c == 4:
-            return expand_4way_contact_to_8(raw)
+            return expand_4way_contact_to_8(raw, wrist_contact_as_env=wrist_contact_as_env)
         raise ValueError(
             f"contact_mask: use_8way_contact is True, expected 4 or 8 columns, got {c}"
         )
@@ -222,7 +269,11 @@ def normalize_contact_mask_labels(
     )
 
 
-def normalize_contact_mask_for_10way(raw: np.ndarray) -> np.ndarray:
+def normalize_contact_mask_for_10way(
+    raw: np.ndarray,
+    *,
+    wrist_contact_as_env: bool = False,
+) -> np.ndarray:
     """
     use_10way_contact: file (T,5) [4-way limbs + pelvis/seat scalar] -> (T,10), or passthrough (T,10).
     """
@@ -233,7 +284,7 @@ def normalize_contact_mask_for_10way(raw: np.ndarray) -> np.ndarray:
     if c == 10:
         return raw
     if c == 5:
-        return expand_5way_contact_to_10(raw)
+        return expand_5way_contact_to_10(raw, wrist_contact_as_env=wrist_contact_as_env)
     raise ValueError(
         "contact_mask: use_10way_contact is True, expected 5 columns "
         f"([Lfoot,Rfoot,Lwrist,Rwrist,pelvis_seat]) or 10 columns, got {c}"
@@ -849,6 +900,8 @@ class RLContactPolicy(RLBasePolicy):
         use_8way_contact=False,
         use_10way_contact=False,
         use_5dim_contact_from_4dim=False,
+        wrist_contact_as_env=False,
+        disable_hand_contact_labels=False,
         ref_motion_start_index=0,
         slow_motion_end_frame=None,
         slow_down_times=None,
@@ -867,6 +920,8 @@ class RLContactPolicy(RLBasePolicy):
         self.lower_joint_indices = ISAAC_TO_MUJOCO[:12]
         self.use_10way_contact = bool(use_10way_contact)
         self.use_5dim_contact_from_4dim = bool(use_5dim_contact_from_4dim)
+        self.wrist_contact_as_env = bool(wrist_contact_as_env)
+        self.disable_hand_contact_labels = bool(disable_hand_contact_labels)
         if self.use_5dim_contact_from_4dim and (not self.use_10way_contact) and use_8way_contact:
             raise ValueError(
                 "use_5dim_contact_from_4dim (5-dim output) requires use_8way_contact: false, "
@@ -939,23 +994,32 @@ class RLContactPolicy(RLBasePolicy):
             #self.contact_mask[35:,2:] = 1
             if self.use_10way_contact and self.use_5dim_contact_from_4dim:
                 m = self.contact_mask
+                wce = self.wrist_contact_as_env
                 if tc == 4:
-                    self.contact_mask = expand_4way_limb_to_10way_with_zero_seat(m)
+                    self.contact_mask = expand_4way_limb_to_10way_with_zero_seat(
+                        m, wrist_contact_as_env=wce
+                    )
                 elif tc == 5:
-                    self.contact_mask = expand_4way_limb_to_10way_with_zero_seat(m[:, :4])
+                    self.contact_mask = expand_4way_limb_to_10way_with_zero_seat(
+                        m[:, :4], wrist_contact_as_env=wce
+                    )
                 elif tc == 8:
                     if use_8way_contact:
                         z2 = np.zeros((m.shape[0], 2), dtype=np.float32)
                         self.contact_mask = np.hstack([m, z2])
                     else:
                         m4 = reduce_8way_contact_to_4(m)
-                        self.contact_mask = expand_4way_limb_to_10way_with_zero_seat(m4)
+                        self.contact_mask = expand_4way_limb_to_10way_with_zero_seat(
+                            m4, wrist_contact_as_env=wce
+                        )
                 else:  # tc == 10
                     z2 = np.zeros((m.shape[0], 2), dtype=np.float32)
                     self.contact_mask = np.hstack([m[:, :8].copy(), z2])
                 self.contact_dim = 10
             elif self.use_10way_contact:
-                self.contact_mask = normalize_contact_mask_for_10way(self.contact_mask)
+                self.contact_mask = normalize_contact_mask_for_10way(
+                    self.contact_mask, wrist_contact_as_env=self.wrist_contact_as_env
+                )
             elif self.use_5dim_contact_from_4dim:
                 m = self.contact_mask
                 if tc == 8:
@@ -966,7 +1030,9 @@ class RLContactPolicy(RLBasePolicy):
                 self.contact_dim = 5
             else:
                 self.contact_mask = normalize_contact_mask_labels(
-                    self.contact_mask, use_8way_contact=use_8way_contact
+                    self.contact_mask,
+                    use_8way_contact=use_8way_contact,
+                    wrist_contact_as_env=self.wrist_contact_as_env,
                 )
             if zero_foot_contact_on_load and self.contact_mask.ndim == 2:
                 self.contact_mask = self.contact_mask.copy()
@@ -981,12 +1047,22 @@ class RLContactPolicy(RLBasePolicy):
                     "[RLContactPolicy] zero_foot_contact_on_load: selected contact channels set to 0",
                     flush=True,
                 )
+            if self.disable_hand_contact_labels and self.contact_mask.ndim == 2:
+                self.contact_mask = zero_hand_contact_channels(
+                    self.contact_mask, contact_dim=self.contact_dim
+                )
+                print(
+                    "[RLContactPolicy] disable_hand_contact_labels: wrist contact channels set to 0",
+                    flush=True,
+                )
         else:
             self.contact_mask = np.zeros((tlen, self.contact_dim), dtype=np.float32)
         print(
             f"[RLContactPolicy] contact_mask (T, C)={self.contact_mask.shape} "
             f"use_8way_contact={use_8way_contact} use_10way_contact={self.use_10way_contact} "
-            f"use_5dim_contact_from_4dim={self.use_5dim_contact_from_4dim}",
+            f"use_5dim_contact_from_4dim={self.use_5dim_contact_from_4dim} "
+            f"wrist_contact_as_env={self.wrist_contact_as_env} "
+            f"disable_hand_contact_labels={self.disable_hand_contact_labels}",
             flush=True,
         )
         self.motion_length = self.ref_motion["joint_pos"].shape[0]
@@ -1122,6 +1198,8 @@ class RLStreamingContactPolicy(RLBasePolicy):
         use_8way_contact=False,
         use_10way_contact=False,
         use_5dim_contact_from_4dim=False,
+        wrist_contact_as_env=False,
+        disable_hand_contact_labels=False,
         ref_motion_start_index=0,
     ):
         super().__init__(onnx_model_path, obs_names, use_sim=use_sim)
@@ -1139,6 +1217,8 @@ class RLStreamingContactPolicy(RLBasePolicy):
 
         self.use_10way_contact = bool(use_10way_contact)
         self.use_5dim_contact_from_4dim = bool(use_5dim_contact_from_4dim)
+        self.wrist_contact_as_env = bool(wrist_contact_as_env)
+        self.disable_hand_contact_labels = bool(disable_hand_contact_labels)
         if self.use_5dim_contact_from_4dim and (not self.use_10way_contact) and use_8way_contact:
             raise ValueError(
                 "use_5dim_contact_from_4dim (5-dim output) requires use_8way_contact: false, "
@@ -1194,16 +1274,17 @@ class RLStreamingContactPolicy(RLBasePolicy):
             self.latest_contact_mask = np.zeros(self.contact_dim, dtype=np.float32)
         else:
             parsed_default_contact = np.asarray(default_contact_label, dtype=np.float32).reshape(-1)
+            wce = self.wrist_contact_as_env
             if self.use_10way_contact and self.use_5dim_contact_from_4dim:
                 p = parsed_default_contact
                 n = p.size
                 if n == 4:
                     parsed_default_contact = expand_4way_limb_to_10way_with_zero_seat(
-                        p.reshape(1, -1)
+                        p.reshape(1, -1), wrist_contact_as_env=wce
                     ).reshape(-1)
                 elif n == 5:
                     parsed_default_contact = expand_4way_limb_to_10way_with_zero_seat(
-                        p[:4].reshape(1, -1)
+                        p[:4].reshape(1, -1), wrist_contact_as_env=wce
                     ).reshape(-1)
                 elif n == 8:
                     if self._limb_contact_file_is_8way:
@@ -1211,7 +1292,7 @@ class RLStreamingContactPolicy(RLBasePolicy):
                     else:
                         m4 = reduce_8way_contact_to_4(p.reshape(1, -1)).reshape(-1)
                         parsed_default_contact = expand_4way_limb_to_10way_with_zero_seat(
-                            m4.reshape(1, -1)
+                            m4.reshape(1, -1), wrist_contact_as_env=wce
                         ).reshape(-1)
                 elif n == 10:
                     parsed_default_contact = np.hstack([p[:8], np.zeros(2, dtype=np.float32)]).reshape(-1)
@@ -1228,7 +1309,8 @@ class RLStreamingContactPolicy(RLBasePolicy):
             elif self.use_10way_contact:
                 if parsed_default_contact.size == 5:
                     parsed_default_contact = expand_5way_contact_to_10(
-                        parsed_default_contact.reshape(1, -1)
+                        parsed_default_contact.reshape(1, -1),
+                        wrist_contact_as_env=wce,
                     ).reshape(-1)
                 if parsed_default_contact.size != self.contact_dim:
                     raise ValueError(
@@ -1254,6 +1336,10 @@ class RLStreamingContactPolicy(RLBasePolicy):
                     f"default_contact_label must contain {self.contact_dim} values, got {parsed_default_contact.size}"
                 )
             self.latest_contact_mask = parsed_default_contact.copy()
+            if self.disable_hand_contact_labels:
+                self.latest_contact_mask = zero_hand_contact_channels(
+                    self.latest_contact_mask, contact_dim=self.contact_dim
+                )
         self.latest_motion_anchor_pos_w = np.zeros(self.anchor_pos_dim, dtype=np.float32)
         self.latest_motion_anchor_orn_w = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)  # xyzw
         self.received_any_stream = False
@@ -1295,7 +1381,9 @@ class RLStreamingContactPolicy(RLBasePolicy):
         print(
             f"[RLStreamingContactPolicy] contact_dim={self.contact_dim} "
             f"use_8way_contact={use_8way_contact} use_10way_contact={self.use_10way_contact} "
-            f"use_5dim_contact_from_4dim={self.use_5dim_contact_from_4dim} — Listening Redis channels:"
+            f"use_5dim_contact_from_4dim={self.use_5dim_contact_from_4dim} "
+            f"wrist_contact_as_env={self.wrist_contact_as_env} "
+            f"disable_hand_contact_labels={self.disable_hand_contact_labels} — Listening Redis channels:"
             f" {self.redis_channels['lower_cmd']}, {self.redis_channels['vr_3point_pos_l']},"
             f" {self.redis_channels['vr_3point_orn_l']}, {self.redis_channels['contact_mask']},"
             f" {self.redis_channels['motion_anchor_pos_w']}, {self.redis_channels['motion_anchor_orn_w']}"
@@ -1342,18 +1430,25 @@ class RLStreamingContactPolicy(RLBasePolicy):
                 elif key == "contact_mask":
                     arr = pickle.loads(data)
                     arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+                    wce = self.wrist_contact_as_env
                     if self.use_10way_contact and self.use_5dim_contact_from_4dim:
                         n = arr.size
                         if n == 4:
-                            arr = expand_4way_limb_to_10way_with_zero_seat(arr.reshape(1, -1)).reshape(-1)
+                            arr = expand_4way_limb_to_10way_with_zero_seat(
+                                arr.reshape(1, -1), wrist_contact_as_env=wce
+                            ).reshape(-1)
                         elif n == 5:
-                            arr = expand_4way_limb_to_10way_with_zero_seat(arr[:4].reshape(1, -1)).reshape(-1)
+                            arr = expand_4way_limb_to_10way_with_zero_seat(
+                                arr[:4].reshape(1, -1), wrist_contact_as_env=wce
+                            ).reshape(-1)
                         elif n == 8:
                             if self._limb_contact_file_is_8way:
                                 arr = np.hstack([arr, np.zeros(2, dtype=np.float32)])
                             else:
                                 m4 = reduce_8way_contact_to_4(arr.reshape(1, -1)).reshape(-1)
-                                arr = expand_4way_limb_to_10way_with_zero_seat(m4.reshape(1, -1)).reshape(-1)
+                                arr = expand_4way_limb_to_10way_with_zero_seat(
+                                    m4.reshape(1, -1), wrist_contact_as_env=wce
+                                ).reshape(-1)
                         elif n == 10:
                             arr = np.hstack([arr[:8], np.zeros(2, dtype=np.float32)])
                         else:
@@ -1366,7 +1461,9 @@ class RLStreamingContactPolicy(RLBasePolicy):
                             )
                     elif self.use_10way_contact:
                         if arr.size == 5:
-                            arr = expand_5way_contact_to_10(arr.reshape(1, -1)).reshape(-1)
+                            arr = expand_5way_contact_to_10(
+                                arr.reshape(1, -1), wrist_contact_as_env=wce
+                            ).reshape(-1)
                         if arr.size != self.contact_dim:
                             raise ValueError(
                                 f"contact stream: expected 5 or {self.contact_dim} values, got {arr.size}"
@@ -1383,6 +1480,8 @@ class RLStreamingContactPolicy(RLBasePolicy):
                             )
                     elif arr.size != self.contact_dim:
                         raise ValueError(f"Expected payload size {self.contact_dim}, got {arr.size}")
+                    if self.disable_hand_contact_labels:
+                        arr = zero_hand_contact_channels(arr, contact_dim=self.contact_dim)
                     self.latest_contact_mask = arr
                 elif key == "motion_anchor_pos_w":
                     self.latest_motion_anchor_pos_w = self._decode_array(data, self.anchor_pos_dim)

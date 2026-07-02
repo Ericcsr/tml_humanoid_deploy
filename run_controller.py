@@ -208,6 +208,7 @@ if __name__ == "__main__":
     parser.add_argument("--net", type=str, required=False, help="Network interface for the robot controller.")
     parser.add_argument("--metric", action="store_true", help="Compute mean joint/root errors vs reference during rollout, then exit.")
     parser.add_argument("--slow_down", type=float, default=1.0, help="Slow down simulation and policy by x times (does not affect simulation_dt).")
+    parser.add_argument("--session-id", type=str, default=None, help="Per-session suffix for redis keys + shared-memory blocks. Used by spawn_server.py for per-user isolation; leave unset for the default single-sim path.")
     args = parser.parse_args()
 
     import yaml
@@ -229,6 +230,8 @@ if __name__ == "__main__":
     # When terrain/object + sim: init robot at first frame xy and heading (for placement)
     terrain_urdf = config.get("terrain_urdf") or ""
     terrain_urdf = str(terrain_urdf).strip() if terrain_urdf else ""
+    terrain_mujoco_xml = config.get("terrain_mujoco_xml") or ""
+    terrain_mujoco_xml = str(terrain_mujoco_xml).strip() if terrain_mujoco_xml else ""
     terrain_box_pos = config.get("terrain_box_pos")
     terrain_box_size = config.get("terrain_box_size")
     has_terrain_box_legacy = terrain_box_pos is not None and terrain_box_size is not None
@@ -252,6 +255,7 @@ if __name__ == "__main__":
     has_object = bool(("object_urdf" in config and object_urdf) or ("object_motion" in config and object_motion))
     init_at_first_frame = bool(
         ("terrain_urdf" in config and terrain_urdf and args.use_sim)
+        or ("terrain_mujoco_xml" in config and terrain_mujoco_xml and args.use_sim)
         or (has_terrain_box and args.use_sim)
         or (has_terrain_wedge and args.use_sim)
         or (has_object and args.use_sim)
@@ -291,7 +295,7 @@ if __name__ == "__main__":
         from ref_motion_visualizer import start_ref_visualizer_process
 
         ticker_value = Value("f", float(config["ref_motion_start_index"]))
-        env = MujocoRobot(config["mujoco_xml_path"], config, ticker_value=ticker_value)
+        env = MujocoRobot(config["mujoco_xml_path"], config, ticker_value=ticker_value, session_id=args.session_id)
         # Only start ref motion visualizer when --metric is enabled
         if args.metric:
             ref_vis_process = start_ref_visualizer_process(
@@ -356,6 +360,21 @@ if __name__ == "__main__":
                 slow_down_times=slow_down_times,
             )                    
     elif config.get("use_streaming_motion", False):
+        # When --session-id is set, suffix every streaming channel name with
+        # ":<sid>" so this controller only sees its own session's motion graph
+        # output. Without this, two concurrent sessions' motion graphs would
+        # publish to the same channel and the policies would receive a mix.
+        _streaming_channels = config.get("streaming_channels", None)
+        if args.session_id:
+            _base_channels = _streaming_channels or {
+                "lower_cmd": "lower_cmd",
+                "vr_3point_pos_l": "vr_3point_pos_l",
+                "vr_3point_orn_l": "vr_3point_orn_l",
+                "contact_mask": "contact_mask",
+                "motion_anchor_pos_w": "motion_anchor_pos_w",
+                "motion_anchor_orn_w": "motion_anchor_orn_w",
+            }
+            _streaming_channels = {k: f"{v}:{args.session_id}" for k, v in _base_channels.items()}
         policy = RLStreamingContactPolicy(
             config["onnx_model_path"],
             config["obs_names"],
@@ -366,11 +385,13 @@ if __name__ == "__main__":
             hist_length=config.get("history_length", 1),
             redis_ip=config.get("streaming_redis_ip", REDIS_IP),
             redis_port=config.get("streaming_redis_port", REDIS_PORT),
-            redis_channels=config.get("streaming_channels", None),
+            redis_channels=_streaming_channels,
             default_contact_label=config.get("default_contact_label", None),
             use_8way_contact=config.get("use_8way_contact", False),
             use_10way_contact=config.get("use_10way_contact", False),
             use_5dim_contact_from_4dim=config.get("use_5dim_contact_from_4dim", False),
+            wrist_contact_as_env=config.get("wrist_contact_as_env", False),
+            disable_hand_contact_labels=config.get("disable_hand_contact_labels", False),
             ref_motion_start_index=config["ref_motion_start_index"],
         )
     elif config.get("use_contact", False):
@@ -389,6 +410,8 @@ if __name__ == "__main__":
             use_8way_contact=config.get("use_8way_contact", False),
             use_10way_contact=config.get("use_10way_contact", False),
             use_5dim_contact_from_4dim=config.get("use_5dim_contact_from_4dim", False),
+            wrist_contact_as_env=config.get("wrist_contact_as_env", False),
+            disable_hand_contact_labels=config.get("disable_hand_contact_labels", False),
             ref_motion_start_index=config["ref_motion_start_index"],
             slow_motion_end_frame=slow_motion_end_frame,
             slow_down_times=slow_down_times,

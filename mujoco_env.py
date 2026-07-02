@@ -1,10 +1,15 @@
 import os
+import struct
 import tempfile
 import time
 import mujoco
 import mujoco.viewer
 import numpy as np
 import torch
+# torch.set_num_threads / set_num_interop_threads is set once in rl_policy.py.
+# Calling it again here would raise: "cannot set number of interop threads after
+# parallel work has started or set_num_interop_threads called".
+torch.set_num_threads(1)
 from scipy.spatial.transform import Rotation
 import scipy
 import pickle
@@ -151,15 +156,22 @@ class ElasticBand:
             self.enable = not self.enable
             print(f"ElasticBand enable: {self.enable}")
 
-def shared_np(size, name, dtype=np.float32):
+def _shm_name(name, session_id=None):
+    """Build a per-session SHM name. Default (no session_id) keeps the bare
+    name so the existing single-sim path stays byte-compatible."""
+    return f"{name}:{session_id}" if session_id else name
+
+
+def shared_np(size, name, dtype=np.float32, session_id=None):
+    full = _shm_name(name, session_id)
     try:
-        shm = SharedMemory(create=True, size=np.prod(size) * np.dtype(dtype).itemsize, name=name)
+        shm = SharedMemory(create=True, size=np.prod(size) * np.dtype(dtype).itemsize, name=full)
         arr = np.ndarray(size, dtype=dtype, buffer=shm.buf)
         arr[:] = 0.0
         shm_buffer.append(shm) # prevent crash
     except FileExistsError:
-        print("Shared memory already exists")
-        shm = SharedMemory(create=False, name=name)
+        print(f"Shared memory already exists: {full}")
+        shm = SharedMemory(create=False, name=full)
         arr = np.ndarray(size, dtype=dtype, buffer=shm.buf)
         arr[:] = 0.0
         shm_buffer.append(shm) # prevent crash
@@ -195,7 +207,12 @@ def _object_hand_center_world_pos(data, left_wrist_body_id, right_wrist_body_id,
     return (left_p + right_p) * 0.5
 
 
-def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None):
+def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None, session_id=None):
+        # session_id (optional): when set, all redis keys + shared-memory blocks
+        # used by this controller are suffixed with `:{session_id}` so multiple
+        # MujocoRobot instances can coexist without colliding on a single host.
+        # Default (session_id=None) keeps the original global-key behavior.
+        _suffix = f":{session_id}" if session_id else ""
         try:
             with open(xml_path, "r") as f:
                 xml = f.read()
@@ -297,18 +314,41 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None)
         elastic_band = ElasticBand(init_pos=band_init_pos, init_quat_xyzw=band_init_quat)
         band_attached_link = model.body("torso_link").id
 
-        viewer = mujoco.viewer.launch_passive(model, data, key_callback=elastic_band.MujuocoKeyCallback)
-        
+        # Viewer policy: open the native MuJoCo viewer when DISPLAY is set unless
+        # explicitly disabled with NO_VIEWER=1. HEADLESS_AUTO is intentionally NOT
+        # consulted here -- it only controls the input("Press Enter") prompt and
+        # the merged-scene-XML dump, not whether to render a window.
+        if os.environ.get("NO_VIEWER") == "1":
+            print("[run_simulation] NO_VIEWER=1: viewer disabled", flush=True)
+            viewer = None
+        elif not os.environ.get("DISPLAY"):
+            print("[run_simulation] no DISPLAY set: viewer disabled", flush=True)
+            viewer = None
+        else:
+            try:
+                viewer = mujoco.viewer.launch_passive(model, data, key_callback=elastic_band.MujuocoKeyCallback)
+                print(f"[run_simulation] native MuJoCo viewer launched on DISPLAY={os.environ['DISPLAY']}", flush=True)
+            except Exception as e:
+                print(f"[run_simulation] viewer launch failed: {e}", flush=True)
+                viewer = None
+
+        try:
+            free_box_id = model.body("free_box").id
+            free_box_jntadr = int(model.body_jntadr[free_box_id])
+            free_box_qposadr = int(model.jnt_qposadr[free_box_jntadr])
+        except Exception:
+            free_box_qposadr = None
+
         ### prepare shared data
-        control = shared_np(30, "control", np.float32)
-        q = shared_np(29, "q", np.float32)
-        dq = shared_np(29, "dq", np.float32)
-        omega_w = shared_np(3, "omega", np.float32)
-        imu_quat = shared_np(4, "imu_quat", np.float32)
-        root_pos = shared_np(3, "root_pos", np.float32)
-        root_vel = shared_np(3, "root_vel", np.float32)
-        torso_pos = shared_np(3, "torso_pos", np.float32)
-        torso_orn = shared_np(4, "torso_orn", np.float32)
+        control = shared_np(30, "control", np.float32, session_id=session_id)
+        q = shared_np(29, "q", np.float32, session_id=session_id)
+        dq = shared_np(29, "dq", np.float32, session_id=session_id)
+        omega_w = shared_np(3, "omega", np.float32, session_id=session_id)
+        imu_quat = shared_np(4, "imu_quat", np.float32, session_id=session_id)
+        root_pos = shared_np(3, "root_pos", np.float32, session_id=session_id)
+        root_vel = shared_np(3, "root_vel", np.float32, session_id=session_id)
+        torso_pos = shared_np(3, "torso_pos", np.float32, session_id=session_id)
+        torso_orn = shared_np(4, "torso_orn", np.float32, session_id=session_id)
         ### prepare other data
         kp = np.array(config['joint_stiffness'], dtype=np.float32)
         kd = np.array(config['joint_damping'], dtype=np.float32)
@@ -321,8 +361,12 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None)
         slam_redis_hz = float(config.get("slam_redis_hz", 10.0))
         slam_redis_period = 1.0 / slam_redis_hz if slam_redis_hz > 0 else 0.1
         torso_slam_body_id = model.body("torso_link").id
+        # Web render-state stream: 43 floats per frame, last-value-wins on Redis SET render_state.
+        render_redis_hz = float(config.get("render_redis_hz", 50.0))
+        render_redis_period = 1.0 / render_redis_hz if render_redis_hz > 0 else 0.02
         ts = time.time()
         ts_acc = time.time()
+        ts_render = time.time()
         while True:
             
             with control_lock:
@@ -422,21 +466,40 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None)
                 )
                 head_ang_vel_w = vel6[0:3].astype(np.float32)
                 head_lin_vel_w = vel6[3:6].astype(np.float32)
-                redis_client.set("head_pos", pickle.dumps(head_pos))
-                redis_client.set("head_quat", pickle.dumps(head_quat_xyzw))
-                redis_client.set("head_lin_vel", pickle.dumps(head_lin_vel_w))
-                redis_client.set("head_ang_vel", pickle.dumps(head_ang_vel_w))
+                redis_client.set(f"head_pos{_suffix}", pickle.dumps(head_pos))
+                redis_client.set(f"head_quat{_suffix}", pickle.dumps(head_quat_xyzw))
+                redis_client.set(f"head_lin_vel{_suffix}", pickle.dumps(head_lin_vel_w))
+                redis_client.set(f"head_ang_vel{_suffix}", pickle.dumps(head_ang_vel_w))
                 ts = now
             if now - ts_acc > 0.02:
-                root_rot = data.xmat[1].reshape(3, 3) 
+                root_rot = data.xmat[1].reshape(3, 3)
                 linear_accel_local = root_rot.T @ (data.qacc[0:3] - np.array([0.0, 0.0, 9.81]))
                 angular_accel_local = root_rot.T @ data.qacc[3:6]
                 root_a = np.hstack([linear_accel_local, angular_accel_local])
-                redis_client.set("ddq", pickle.dumps(data.qacc[6:35]))
-                redis_client.set("root_a", pickle.dumps(root_a))
-                redis_client.set("tau", pickle.dumps(data.ctrl[:]))
+                redis_client.set(f"ddq{_suffix}", pickle.dumps(data.qacc[6:35]))
+                redis_client.set(f"root_a{_suffix}", pickle.dumps(root_a))
+                redis_client.set(f"tau{_suffix}", pickle.dumps(data.ctrl[:]))
                 ts_acc = now
-            viewer.sync()                                                                  
+            if now - ts_render >= render_redis_period:
+                if free_box_qposadr is not None:
+                    box_qpos = data.qpos[free_box_qposadr:free_box_qposadr + 7]
+                    box_floats = (
+                        float(box_qpos[0]), float(box_qpos[1]), float(box_qpos[2]),
+                        float(box_qpos[3]), float(box_qpos[4]), float(box_qpos[5]), float(box_qpos[6]),
+                    )
+                else:
+                    box_floats = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+                payload = struct.pack(
+                    "<43f",
+                    float(data.qpos[0]), float(data.qpos[1]), float(data.qpos[2]),
+                    float(data.qpos[3]), float(data.qpos[4]), float(data.qpos[5]), float(data.qpos[6]),
+                    *(float(x) for x in data.qpos[7:36]),
+                    *box_floats,
+                )
+                redis_client.set(f"render_state{_suffix}", payload)
+                ts_render = now
+            if viewer is not None:
+                viewer.sync()
             rate.sleep()
             #print("Sim step fps:", 1/(time.time() - ts))
 
@@ -446,8 +509,10 @@ class MujocoRobot:
             xml_path,
             config,
             ticker_value=None,
+            session_id=None,
         ):
         self.xml_path = xml_path
+        self.session_id = session_id
         self._terrain_temp_file = None
         xml_path_to_load = xml_path
 
@@ -804,6 +869,46 @@ class MujocoRobot:
                 flush=True,
             )
 
+        terrain_mujoco_xml = config.get("terrain_mujoco_xml") or ""
+        terrain_mujoco_xml = str(terrain_mujoco_xml).strip() if terrain_mujoco_xml else ""
+        if terrain_mujoco_xml and terrain_urdf:
+            raise ValueError("Use only one of terrain_mujoco_xml or terrain_urdf, not both")
+        if has_terrain_box and terrain_mujoco_xml:
+            raise ValueError("Use only one of terrain_mujoco_xml or terrain_boxes, not both")
+
+        if "terrain_mujoco_xml" in config and terrain_mujoco_xml:
+            from utils.urdf_to_mujoco import merge_mujoco_terrain_into_scene_xml
+
+            terrain_path = (
+                os.path.abspath(terrain_mujoco_xml)
+                if os.path.isabs(terrain_mujoco_xml)
+                else os.path.normpath(os.path.join(os.getcwd(), terrain_mujoco_xml))
+            )
+            if not os.path.exists(terrain_path):
+                raise FileNotFoundError(
+                    f"terrain_mujoco_xml not found: {terrain_path}\n"
+                    f"  (resolved from config terrain_mujoco_xml: {terrain_mujoco_xml})"
+                )
+            tuo = config.get("terrain_mujoco_xml_offset", config.get("terrain_urdf_offset"))
+            if tuo is not None:
+                terrain_offset = tuple(float(x) for x in tuo)
+                if len(terrain_offset) != 3:
+                    raise ValueError("terrain_mujoco_xml_offset must be length-3 [x, y, z] (m)")
+            else:
+                terrain_offset = (0.0, 0.0, 0.0)
+            scene_xml = merge_mujoco_terrain_into_scene_xml(
+                scene_xml,
+                terrain_path,
+                terrain_offset=terrain_offset,
+            )
+            scene_dirty = True
+            if terrain_offset != (0.0, 0.0, 0.0):
+                print(
+                    f"[MujocoRobot] terrain_mujoco_xml_offset world (m)={terrain_offset}",
+                    flush=True,
+                )
+            print(f"[MujocoRobot] Merged terrain MJCF from {terrain_path}", flush=True)
+
         if "terrain_urdf" in config and terrain_urdf:
             from utils.urdf_to_mujoco import merge_terrain_into_scene_from_string
 
@@ -918,22 +1023,47 @@ class MujocoRobot:
                 raise
             print(f"[MujocoRobot] Object loaded from {object_path}", flush=True)
 
-        self.control_var = shared_np(30, "control", np.float32)
-        self.q_var = shared_np(29, "q", np.float32)
-        self.dq_var = shared_np(29, "dq", np.float32)
-        self.omega_var = shared_np(3, "omega", np.float32)
-        self.imu_quat_var = shared_np(4, "imu_quat", np.float32)
-        self.root_pos = shared_np(3, "root_pos", np.float32)
-        self.root_vel = shared_np(3, "root_vel", np.float32)
-        self.torso_pos = shared_np(3, "torso_pos", np.float32)
-        self.torso_orn = shared_np(4, "torso_orn", np.float32)
+        self.control_var = shared_np(30, "control", np.float32, session_id=session_id)
+        self.q_var = shared_np(29, "q", np.float32, session_id=session_id)
+        self.dq_var = shared_np(29, "dq", np.float32, session_id=session_id)
+        self.omega_var = shared_np(3, "omega", np.float32, session_id=session_id)
+        self.imu_quat_var = shared_np(4, "imu_quat", np.float32, session_id=session_id)
+        self.root_pos = shared_np(3, "root_pos", np.float32, session_id=session_id)
+        self.root_vel = shared_np(3, "root_vel", np.float32, session_id=session_id)
+        self.torso_pos = shared_np(3, "torso_pos", np.float32, session_id=session_id)
+        self.torso_orn = shared_np(4, "torso_orn", np.float32, session_id=session_id)
 
         self.control_lock = mp.Lock()
         self.data_lock = mp.Lock()
         self.config = config
         self.control_dt = config.get("control_dt", 0.02) # default 50 Hz
-        self.process = mp.Process(target=run_simulation, args=(self.control_lock, self.data_lock, xml_path_to_load, self.config, ticker_value))
+        # Dump the merged scene XML so a web frontend can load the same model.
+        # Path is fixed; web/run_all.sh copies it into mujoco_wasm/public/ before vite starts.
+        if os.environ.get("HEADLESS_AUTO") == "1":
+            try:
+                with open(xml_path_to_load, "r") as _f:
+                    _final_xml = _f.read()
+                with open("/tmp/web_scene.xml", "w") as _f:
+                    _f.write(_final_xml)
+                print("[MujocoRobot] dumped merged scene XML to /tmp/web_scene.xml", flush=True)
+            except Exception as _e:
+                print(f"[MujocoRobot] could not dump scene XML: {_e}", flush=True)
+        self.process = mp.Process(target=run_simulation, args=(self.control_lock, self.data_lock, xml_path_to_load, self.config, ticker_value, session_id))
         self.process.start()
+        # Quat barrier: wait for the simulation child to publish a non-zero IMU quat before
+        # the parent reads from shared memory (otherwise scipy's Rotation.from_quat raises
+        # "Found zero norm quaternions"). Polls the shared memory the child writes after mj_step.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            with self.data_lock:
+                q_norm = float(np.linalg.norm(self.imu_quat_var))
+            if q_norm > 0.5:
+                break
+            if not self.process.is_alive():
+                raise RuntimeError("MuJoCo simulation child exited during startup")
+            time.sleep(0.005)
+        else:
+            raise RuntimeError("MuJoCo simulation child failed to publish initial state within 5s")
 
     def pd_control(self, target_q):
         with self.control_lock:
@@ -960,7 +1090,11 @@ class MujocoRobot:
     def maintain_state(self, q):
         self.pd_control(q)
         self.init_q = q.copy()
-        input("Press Enter to continue...")
+        if os.environ.get("HEADLESS_AUTO") == "1":
+            print("[MujocoRobot] HEADLESS_AUTO=1: skipping Press-Enter; settling 1s", flush=True)
+            time.sleep(1.0)
+        else:
+            input("Press Enter to continue...")
         
     def damping_state(self):
         self.pd_control(DAMPING)

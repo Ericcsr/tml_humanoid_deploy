@@ -734,6 +734,215 @@ def merge_free_box_into_scene_xml(
     return _insert_after_worldbody_open(scene_xml, body_xml)
 
 
+def _build_mujoco_class_defaults(terrain_root) -> dict:
+    """Map MuJoCo default class path (e.g. ladder/collision) -> {tag -> attribs}."""
+    classes: dict = {}
+
+    def visit(default_node, prefix: str) -> None:
+        cls = default_node.get("class")
+        if cls:
+            path = f"{prefix}/{cls}" if prefix else cls
+        else:
+            path = prefix
+        for sub in default_node:
+            if sub.tag == "default":
+                visit(sub, path)
+            elif path:
+                classes.setdefault(path, {}).setdefault(sub.tag, {})
+                classes[path][sub.tag].update(sub.attrib)
+
+    top = terrain_root.find("default")
+    if top is not None:
+        for child in top.findall("default"):
+            visit(child, "")
+    return classes
+
+
+def _inline_mujoco_terrain_defaults(elem, class_path: str, classes: dict) -> None:
+    """Apply terrain default classes directly on geoms; drop class/childclass attrs."""
+    if elem.tag == "body":
+        childclass = elem.get("childclass", class_path)
+        if "childclass" in elem.attrib:
+            del elem.attrib["childclass"]
+        new_path = childclass or class_path
+        for child in list(elem):
+            _inline_mujoco_terrain_defaults(child, new_path, classes)
+    elif elem.tag == "geom":
+        geom_class = elem.get("class", "")
+        if class_path and geom_class:
+            full_path = f"{class_path}/{geom_class}"
+        else:
+            full_path = geom_class or class_path
+        for k, v in classes.get(full_path, {}).get("geom", {}).items():
+            if k not in elem.attrib:
+                elem.set(k, v)
+        elem.attrib.pop("class", None)
+    else:
+        for child in list(elem):
+            _inline_mujoco_terrain_defaults(child, class_path, classes)
+
+
+_SCENE_INFRA_GEOM_NAMES = frozenset({"floor", "ground", "groundplane"})
+_WORLDBODY_SKIP_TAGS = frozenset({"light", "camera"})
+_SKIP_ASSET_NAMES = frozenset({"groundplane"})
+_SKIP_TEXTURE_TYPES = frozenset({"skybox"})
+
+
+def _collect_named_assets(root) -> set:
+    names: set = set()
+    asset = root.find("asset")
+    if asset is None:
+        return names
+    for child in asset:
+        name = child.get("name")
+        if name:
+            names.add(name)
+    return names
+
+
+def _collect_named_bodies_and_geoms(root) -> set:
+    names: set = set()
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        return names
+    for elem in worldbody.iter():
+        if elem.tag in ("body", "geom", "site", "joint"):
+            name = elem.get("name")
+            if name:
+                names.add(name)
+    return names
+
+
+def _is_scene_infra_worldbody_child(elem) -> bool:
+    """True for floor/lights/cameras — not terrain geometry."""
+    if elem.tag in _WORLDBODY_SKIP_TAGS:
+        return True
+    if elem.tag != "geom":
+        return False
+    name = (elem.get("name") or "").strip().lower()
+    if name in _SCENE_INFRA_GEOM_NAMES:
+        return True
+    if elem.get("type") == "plane":
+        return True
+    return False
+
+
+def _terrain_asset_child_needed(child, existing_asset_names: set) -> bool:
+    name = child.get("name")
+    if name and name in existing_asset_names:
+        return False
+    if name and name in _SKIP_ASSET_NAMES:
+        return False
+    if child.tag == "texture" and child.get("type") in _SKIP_TEXTURE_TYPES:
+        return False
+    return True
+
+
+def _ensure_unique_terrain_names(elem, existing_names: set, prefix: str = "terrain_") -> None:
+    """Rename body/geom/site/joint if name already exists in the target scene."""
+    if elem.tag in ("body", "geom", "site", "joint"):
+        name = elem.get("name")
+        if name and name in existing_names:
+            base = f"{prefix}{name}"
+            candidate = base
+            idx = 0
+            while candidate in existing_names:
+                idx += 1
+                candidate = f"{base}_{idx}"
+            elem.set("name", candidate)
+            existing_names.add(candidate)
+        elif name:
+            existing_names.add(name)
+    for child in elem:
+        _ensure_unique_terrain_names(child, existing_names, prefix=prefix)
+
+
+def _extract_terrain_worldbody_children(terrain_worldbody) -> list:
+    """Keep terrain bodies/geoms only; skip floor, lights, and other scene infra."""
+    import copy
+
+    children = []
+    for child in terrain_worldbody:
+        if _is_scene_infra_worldbody_child(child):
+            continue
+        if child.tag not in ("body", "geom", "site"):
+            continue
+        children.append(copy.deepcopy(child))
+    return children
+
+
+def merge_mujoco_terrain_into_scene_xml(
+    scene_xml: str,
+    terrain_mujoco_path: str,
+    terrain_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> str:
+    """
+    Merge terrain-only content from a MuJoCo MJCF into a robot scene.
+
+    Imports collision/visual geoms and terrain bodies from <worldbody>, skipping scene
+    infrastructure (floor plane, lights, cameras). Merges only assets not already
+    present in the scene. Default classes are inlined onto geoms when present.
+    terrain_offset: world-frame translation (m) wrapping all merged worldbody content.
+    """
+    import copy
+    import xml.etree.ElementTree as ET
+
+    terrain_root = ET.parse(terrain_mujoco_path).getroot()
+    scene_root = ET.fromstring(scene_xml)
+    class_defaults = _build_mujoco_class_defaults(terrain_root)
+    existing_asset_names = _collect_named_assets(scene_root)
+    existing_body_geom_names = _collect_named_bodies_and_geoms(scene_root)
+
+    terrain_asset = terrain_root.find("asset")
+    if terrain_asset is not None and len(terrain_asset):
+        scene_asset = scene_root.find("asset")
+        if scene_asset is None:
+            worldbody = scene_root.find("worldbody")
+            insert_idx = list(scene_root).index(worldbody) if worldbody is not None else len(scene_root)
+            scene_asset = ET.Element("asset")
+            scene_root.insert(insert_idx, scene_asset)
+        for child in list(terrain_asset):
+            if not _terrain_asset_child_needed(child, existing_asset_names):
+                continue
+            scene_asset.append(copy.deepcopy(child))
+            name = child.get("name")
+            if name:
+                existing_asset_names.add(name)
+
+    terrain_worldbody = terrain_root.find("worldbody")
+    if terrain_worldbody is not None and len(terrain_worldbody):
+        scene_worldbody = scene_root.find("worldbody")
+        if scene_worldbody is None:
+            raise ValueError("Scene XML has no <worldbody>")
+
+        ox, oy, oz = float(terrain_offset[0]), float(terrain_offset[1]), float(terrain_offset[2])
+        terrain_children = _extract_terrain_worldbody_children(terrain_worldbody)
+        if not terrain_children:
+            raise ValueError(
+                f"No terrain geoms/bodies found in {terrain_mujoco_path} "
+                "(after skipping floor, lights, and cameras)"
+            )
+        for child in terrain_children:
+            _inline_mujoco_terrain_defaults(child, "", class_defaults)
+            _ensure_unique_terrain_names(child, existing_body_geom_names)
+
+        if abs(ox) > 0.0 or abs(oy) > 0.0 or abs(oz) > 0.0:
+            wrapper = ET.Element(
+                "body",
+                name="terrain_mujoco_root",
+                pos=f"{ox} {oy} {oz}",
+                quat="1 0 0 0",
+            )
+            for child in terrain_children:
+                wrapper.append(child)
+            scene_worldbody.append(wrapper)
+        else:
+            for child in terrain_children:
+                scene_worldbody.append(child)
+
+    return ET.tostring(scene_root, encoding="unicode")
+
+
 def merge_terrain_into_scene_from_string(
     scene_xml: str,
     terrain_urdf_path: str,

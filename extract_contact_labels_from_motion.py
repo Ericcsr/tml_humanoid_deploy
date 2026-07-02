@@ -24,6 +24,11 @@ Optional --heightmap: *_heightmap.npy dict with hmap, grid_res, grid_size — en
 pass (crawl) using wrist link positions vs surface, analogous to RobotHandTerrainModule. Deploy
 g1_29dof uses left_wrist_yaw_link / right_wrist_yaw_link (not rubber hands).
 
+Optional --detect-hand-motion-contact: same velocity/acceleration heuristic as feet, applied to
+wrist link world positions (no heightmap). By default, hand contact before the first wrist
+movement (see --hand-movement-min-displacement) is suppressed; pass --hand-contact-from-start
+to label from frame 0.
+
 Optional --visualize: passive MuJoCo viewer — plays back the motion and draws spheres at foot soles
 and wrists; green/blue/yellow/magenta when that limb is in contact (per contact_mask), dim gray when not.
 
@@ -59,6 +64,7 @@ import mujoco
 import mujoco.viewer
 
 from utils.params import ISAAC_TO_MUJOCO
+import qpos_to_motion
 
 HAND_VIZ_BODIES = ("left_wrist_yaw_link", "right_wrist_yaw_link")
 
@@ -510,14 +516,16 @@ def kinematics_process(
     return pos_f, vel, acc
 
 
-def detect_foot_contact_nodes(
+def detect_motion_contact_nodes(
     pos_filt: np.ndarray,
     vel: np.ndarray,
     acc: np.ndarray,
-    foot_joint_names: tuple[str, str],
+    limb_joint_names: tuple[str, str],
     config: dict,
+    *,
+    contact_label: str = "floor",
 ) -> list[dict]:
-    """Same criterion as RobotContactModule.detect_feet; returns graph-style node dicts."""
+    """Velocity/acceleration contact heuristic (RobotContactModule.detect_feet equivalent)."""
     joint_speeds = np.linalg.norm(vel, axis=2)
     body_energy = np.mean(joint_speeds, axis=1)
     energy_smooth = ndimage.gaussian_filter1d(
@@ -540,14 +548,27 @@ def detect_foot_contact_nodes(
                     {
                         "position": pos_filt[t, i].copy(),
                         "timestamp": int(t),
-                        "label": "floor",
+                        "label": contact_label,
                         "entity_info": {
-                            "joint_name": foot_joint_names[i],
+                            "joint_name": limb_joint_names[i],
                             "joint_index": int(i),
                         },
                     }
                 )
     return nodes
+
+
+def detect_foot_contact_nodes(
+    pos_filt: np.ndarray,
+    vel: np.ndarray,
+    acc: np.ndarray,
+    foot_joint_names: tuple[str, str],
+    config: dict,
+) -> list[dict]:
+    """Same criterion as RobotContactModule.detect_feet; returns graph-style node dicts."""
+    return detect_motion_contact_nodes(
+        pos_filt, vel, acc, foot_joint_names, config, contact_label="floor"
+    )
 
 
 def detect_hand_terrain_nodes(
@@ -557,12 +578,16 @@ def detect_hand_terrain_nodes(
     grid_res: float,
     grid_size: float,
     z_tolerance: float,
+    *,
+    min_timestamp: int = 0,
 ) -> list[dict]:
     """RobotHandTerrainModule.detect equivalent (no SceneInteractionGraph)."""
     half = grid_size / 2.0
     dim = hmap.shape[0]
     nodes: list[dict] = []
     for t in range(hand_pos.shape[0]):
+        if t < min_timestamp:
+            continue
         for i in range(2):
             x, y, z = hand_pos[t, i]
             u = int((x + half) / grid_res)
@@ -583,6 +608,41 @@ def detect_hand_terrain_nodes(
                     }
                 )
     return nodes
+
+
+def first_hand_movement_frame(
+    hand_pos: np.ndarray,
+    *,
+    min_displacement: float = 0.03,
+) -> int:
+    """First frame where either wrist moves min_displacement (m) from its frame-0 pose.
+
+    Returns ``hand_pos.shape[0]`` if neither wrist ever moves that far (suppress all hand contact).
+    """
+    if hand_pos.shape[0] <= 1 or min_displacement <= 0:
+        return 0
+    origin = hand_pos[0]  # (2, 3)
+    disp = np.linalg.norm(hand_pos - origin[np.newaxis, :, :], axis=2)  # (T, 2)
+    moved = np.any(disp >= min_displacement, axis=1)
+    idxs = np.flatnonzero(moved)
+    return int(idxs[0]) if idxs.size else int(hand_pos.shape[0])
+
+
+def filter_hand_contact_nodes_before_frame(
+    nodes: list[dict],
+    start_frame: int,
+) -> tuple[list[dict], int]:
+    """Drop hand_terrain nodes with timestamp < start_frame. Returns (filtered, dropped_count)."""
+    if start_frame <= 0:
+        return nodes, 0
+    kept: list[dict] = []
+    dropped = 0
+    for node in nodes:
+        if node.get("label") == "hand_terrain" and int(node.get("timestamp", 0)) < start_frame:
+            dropped += 1
+            continue
+        kept.append(node)
+    return kept, dropped
 
 
 # --------------------------------------------------------------------------- #
@@ -845,6 +905,27 @@ def main():
         default=None,
         help="Motion sampling rate (Hz). If ref has no 'fps' key, this is required.",
     )
+    parser.add_argument(
+        "--root-layout",
+        choices=["pos_first", "quat_first"],
+        default=None,
+        help="For qpos-format input only: root layout of the first 7 qpos entries. "
+        "'pos_first' = [x, y, z, qw, qx, qy, qz] (default), "
+        "'quat_first' = [qw, qx, qy, qz, x, y, z]. Overrides --rot-first if both given.",
+    )
+    parser.add_argument(
+        "--rot-first",
+        action="store_true",
+        help="For qpos-format input only: alias for --root-layout quat_first.",
+    )
+    parser.add_argument(
+        "--save-converted-motion",
+        type=Path,
+        default=None,
+        help="For qpos-format input only: also save the converted joint+body motion to this "
+        ".npz (same schema as omni_to_npz: fps, joint_pos, joint_vel, body_pos_w, body_quat_w, "
+        "body_lin_vel_w, body_ang_vel_w, body_names).",
+    )
     parser.add_argument("--merge-time-gap", type=int, default=10)
     parser.add_argument("--merge-spatial-dist", type=float, default=0.15)
     parser.add_argument("--merge-gap-fill", type=int, default=5)
@@ -865,6 +946,26 @@ def main():
         type=Path,
         default=None,
         help="Optional terrain_heightmap npy dict (keys hmap, grid_res, grid_size) for hand pass",
+    )
+    parser.add_argument(
+        "--detect-hand-motion-contact",
+        action="store_true",
+        help="Detect hand contact with the same velocity/acceleration heuristic as feet "
+        "(wrist link FK positions; no heightmap). Can be combined with --heightmap.",
+    )
+    parser.add_argument(
+        "--hand-contact-from-start",
+        action="store_true",
+        help="Allow hand contact labels from frame 0. Default: ignore hand contact until "
+        "either wrist moves --hand-movement-min-displacement from its initial pose "
+        "(static start pose is often not in contact).",
+    )
+    parser.add_argument(
+        "--hand-movement-min-displacement",
+        type=float,
+        default=0.03,
+        help="Meters — either wrist must move this far from frame-0 pose before hand contact "
+        "is considered (default 0.03). Only used when --hand-contact-from-start is not set.",
     )
     parser.add_argument(
         "--hand-z-tolerance",
@@ -954,9 +1055,47 @@ def main():
             parser.error(f"--terrain-urdf not found: {terrain_urdf_for_viz}")
 
     data = np.load(args.ref_motion, allow_pickle=True)
-    joint_pos = np.asarray(data["joint_pos"], dtype=np.float64)
-    body_pos_w = np.asarray(data["body_pos_w"], dtype=np.float64)
-    body_quat_w = np.asarray(data["body_quat_w"], dtype=np.float64)
+    model, mj_data = _load_robot(args.robot_xml)
+
+    # Auto-detect raw qpos-format input (e.g. retargeted motion, input to omni_to_npz) and
+    # convert it to joint + body-state format with MuJoCo FK before processing.
+    if qpos_to_motion.is_qpos_motion(data):
+        if args.root_layout is not None:
+            rot_first = args.root_layout == "quat_first"
+        else:
+            rot_first = args.rot_first
+        print(
+            "[extract] Detected qpos-format input; converting to joint+body data via MuJoCo FK "
+            f"(root_layout={'quat_first' if rot_first else 'pos_first'}).",
+            flush=True,
+        )
+        qpos_arr, fps_in = qpos_to_motion.load_qpos_motion(args.ref_motion)
+        motion = qpos_to_motion.convert_qpos_to_motion(
+            qpos_arr, fps_in, model, rot_first=rot_first, output_fps=None
+        )
+        joint_pos = np.asarray(motion["joint_pos"], dtype=np.float64)
+        body_pos_w = np.asarray(motion["body_pos_w"], dtype=np.float64)
+        body_quat_w = np.asarray(motion["body_quat_w"], dtype=np.float64)
+        if args.fps is None:
+            args.fps = float(np.asarray(motion["fps"]).reshape(-1)[0])
+        if args.save_converted_motion is not None:
+            qpos_to_motion.save_motion_npz(args.save_converted_motion, motion)
+            print(
+                f"[extract] Saved converted motion to {args.save_converted_motion} "
+                f"(joint_pos={motion['joint_pos'].shape}, body_pos_w={motion['body_pos_w'].shape})",
+                flush=True,
+            )
+    else:
+        if args.save_converted_motion is not None:
+            print(
+                "[extract] --save-converted-motion ignored: input is already in joint+body "
+                "format (not qpos).",
+                flush=True,
+            )
+        joint_pos = np.asarray(data["joint_pos"], dtype=np.float64)
+        body_pos_w = np.asarray(data["body_pos_w"], dtype=np.float64)
+        body_quat_w = np.asarray(data["body_quat_w"], dtype=np.float64)
+
     t = joint_pos.shape[0]
     if body_pos_w.shape[0] != t or body_quat_w.shape[0] != t:
         raise ValueError("joint_pos / body_pos_w / body_quat_w length mismatch")
@@ -972,7 +1111,6 @@ def main():
                 "No fps in ref motion; pass --fps (e.g. 50.0 for typical deploy / sim export)."
             )
 
-    model, mj_data = _load_robot(args.robot_xml)
     qpos = ref_motion_to_mujoco_qpos(joint_pos, body_pos_w, body_quat_w)
     if qpos.shape[1] != model.nq:
         raise ValueError(
@@ -997,6 +1135,48 @@ def main():
     names_feet = FOOT_BODIES
     nodes = detect_foot_contact_nodes(pos_f, vel, acc, names_feet, cfg)
 
+    hand_links = HAND_VIZ_BODIES
+    hand_motion_start = 0
+    hand_world_for_gate: np.ndarray | None = None
+    if (args.detect_hand_motion_contact or args.heightmap is not None) and not args.hand_contact_from_start:
+        hand_world_for_gate = compute_body_positions(model, mj_data, qpos, hand_links)
+        hand_motion_start = first_hand_movement_frame(
+            hand_world_for_gate,
+            min_displacement=args.hand_movement_min_displacement,
+        )
+        if hand_motion_start >= t:
+            print(
+                f"[extract] Hand contact gated: no wrist moved >= {args.hand_movement_min_displacement:g} m "
+                f"from frame-0 pose; suppressing all hand contact.",
+                flush=True,
+            )
+        elif hand_motion_start > 0:
+            print(
+                f"[extract] Hand contact gated: ignoring hand contact before frame {hand_motion_start} "
+                f"(first wrist movement >= {args.hand_movement_min_displacement:g} m from start).",
+                flush=True,
+            )
+
+    if args.detect_hand_motion_contact:
+        hand_world = (
+            hand_world_for_gate
+            if hand_world_for_gate is not None
+            else compute_body_positions(model, mj_data, qpos, hand_links)
+        )
+        hand_pos_f, hand_vel, hand_acc = kinematics_process(
+            hand_world, fps, cfg["FILTER_ORDER"], cfg["FILTER_CUTOFF"]
+        )
+        hand_nodes = detect_motion_contact_nodes(
+            hand_pos_f, hand_vel, hand_acc, hand_links, cfg, contact_label="hand_terrain"
+        )
+        hand_nodes, dropped = filter_hand_contact_nodes_before_frame(hand_nodes, hand_motion_start)
+        nodes.extend(hand_nodes)
+        print(
+            f"[extract] Hand motion-contact pass: {len(hand_nodes)} raw nodes "
+            f"(dropped {dropped} before movement start; wrists: {hand_links[0]}, {hand_links[1]})",
+            flush=True,
+        )
+
     if args.heightmap is not None:
         loaded = np.load(args.heightmap, allow_pickle=True)
         if isinstance(loaded, np.ndarray) and loaded.shape == ():
@@ -1008,18 +1188,21 @@ def main():
         hmap = np.asarray(hm["hmap"], dtype=np.float64)
         grid_res = float(hm["grid_res"])
         grid_size = float(hm["grid_size"])
-        hand_links = ("left_wrist_yaw_link", "right_wrist_yaw_link")
-        hand_pos = compute_body_positions(model, mj_data, qpos, hand_links)
-        nodes.extend(
-            detect_hand_terrain_nodes(
-                hand_pos,
-                hand_links,
-                hmap,
-                grid_res,
-                grid_size,
-                args.hand_z_tolerance,
-            )
+        hand_pos = (
+            hand_world_for_gate
+            if hand_world_for_gate is not None
+            else compute_body_positions(model, mj_data, qpos, hand_links)
         )
+        hm_nodes = detect_hand_terrain_nodes(
+            hand_pos,
+            hand_links,
+            hmap,
+            grid_res,
+            grid_size,
+            args.hand_z_tolerance,
+            min_timestamp=hand_motion_start,
+        )
+        nodes.extend(hm_nodes)
 
     min_dur_fr = max(0, int(args.min_contact_duration * fps))
     lead_fr = max(0, int(args.contact_lead_time * fps))

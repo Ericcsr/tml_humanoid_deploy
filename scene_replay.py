@@ -19,6 +19,7 @@ from utils.urdf_to_mujoco import (
     merge_object_into_scene,
     merge_terrain_box_into_scene_xml,
     merge_terrain_boxes_into_scene_xml,
+    merge_mujoco_terrain_into_scene_xml,
     merge_terrain_into_scene_from_string,
     merge_terrain_wedges_into_scene_xml,
 )
@@ -253,6 +254,22 @@ def _merge_scene_xml(
         if len(rgba_t) != 4:
             raise ValueError("free_box_rgba must be length-4")
         scene_xml = merge_free_box_into_scene_xml(scene_xml, pos_t, size_t, mass, rgba_t)
+
+    terrain_mujoco_xml = str(cfg.get("terrain_mujoco_xml", "") or "").strip()
+    if terrain_mujoco_xml:
+        if str(cfg.get("terrain_urdf", "") or "").strip():
+            raise ValueError("Use only one of terrain_mujoco_xml or terrain_urdf, not both")
+        terrain_path = _resolve_path(terrain_mujoco_xml, config_dir, workspace_root)
+        terrain_offset = tuple(
+            float(x) for x in cfg.get("terrain_mujoco_xml_offset", cfg.get("terrain_urdf_offset", (0.0, 0.0, 0.0)))
+        )
+        if len(terrain_offset) != 3:
+            raise ValueError("terrain_mujoco_xml_offset must be length-3 [x, y, z]")
+        scene_xml = merge_mujoco_terrain_into_scene_xml(
+            scene_xml,
+            terrain_path,
+            terrain_offset=terrain_offset,
+        )
 
     # terrain URDF
     terrain_urdf = str(cfg.get("terrain_urdf", "") or "").strip()
