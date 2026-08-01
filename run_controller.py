@@ -73,8 +73,9 @@ def compute_metrics(robot_state, policy, mid, init_offset=None):
     return joint_err, root_pos_err, root_orn_err, robot_rel_pos.copy(), ref_rel_pos.copy()
 
 
-def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
-    
+def main(env, policy, config, ticker_value=None, compute_metrics_flag=False,
+         render_client=None):
+
     if config["use_root_state"] and config.get("use_odom", False):
         redis_client = redis.Redis(host=REDIS_IP, port=REDIS_PORT, db=0)
 
@@ -195,6 +196,16 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
 
         robot_state.last_action = action.copy() # save last action
 
+        # Stream robot state to the egocentric render server (non-blocking).
+        # Requires use_root_state for a world root pose; quat is xyzw.
+        if render_client is not None and config["use_root_state"]:
+            fid = render_client.next_frame_id()
+            render_client.send_state(fid, robot_state.root_pos,
+                                     robot_state.root_orn, robot_state.q)
+            frame = render_client.try_recv_frame()
+            if frame is not None:
+                render_client.show(frame)
+
         scaled_action = action[ISAAC_TO_MUJOCO] * policy.action_scale + policy.default_value["q"][ISAAC_TO_MUJOCO]
         env.step_robot(scaled_action)
         rate.sleep()
@@ -208,6 +219,9 @@ if __name__ == "__main__":
     parser.add_argument("--net", type=str, required=False, help="Network interface for the robot controller.")
     parser.add_argument("--metric", action="store_true", help="Compute mean joint/root errors vs reference during rollout, then exit.")
     parser.add_argument("--slow_down", type=float, default=1.0, help="Slow down simulation and policy by x times (does not affect simulation_dt).")
+    parser.add_argument("--render", action="store_true", help="Stream robot state to the stair render server (rendering env) and show the egocentric camera view.")
+    parser.add_argument("--render_host", type=str, default="localhost", help="Redis host of the render server.")
+    parser.add_argument("--render_port", type=int, default=6379, help="Redis port of the render server.")
     args = parser.parse_args()
 
     import yaml
@@ -222,6 +236,9 @@ if __name__ == "__main__":
 
     if args.metric and not config.get("use_root_state", False):
         raise ValueError("--metric requires use_root_state: True in config (for root position/orientation).")
+
+    if args.render and not config.get("use_root_state", False):
+        raise ValueError("--render requires use_root_state: True in config (for the robot world root pose).")
 
     if args.slow_down != 1.0:
         print(f"[run_controller] Slow down: {args.slow_down}x (simulation_dt unchanged)", flush=True)
@@ -407,13 +424,23 @@ if __name__ == "__main__":
             slow_down_times=slow_down_times,
         )
 
+    render_client = None
+    if args.render:
+        from render_stream_client import StairRenderStreamClient
+        render_client = StairRenderStreamClient(host=args.render_host, port=args.render_port)
+        if not render_client.connect(timeout=10):
+            render_client = None  # server absent: run render-free
+
     try:
-        result = main(env, policy, config, ticker_value=ticker_value, compute_metrics_flag=args.metric)
+        result = main(env, policy, config, ticker_value=ticker_value,
+                      compute_metrics_flag=args.metric, render_client=render_client)
         if result is not None and args.metric:
             robot_traj, ref_traj = result
             from trajectory_visualizer import plot_root_trajectories
             plot_root_trajectories(robot_traj, ref_traj)
     finally:
+        if render_client is not None:
+            render_client.close()
         if ref_vis_process is not None:
             ref_vis_process.terminate()
             ref_vis_process.join()

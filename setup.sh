@@ -1,6 +1,6 @@
 conda create -n bm python=3.10.18
 conda activate bm
-pip install mujoco joblib onnxruntime pybullet scipy torch PyYAML opencv-python redis
+pip install mujoco joblib onnxruntime pybullet scipy torch PyYAML pynput opencv-python redis
 sudo apt install redis-server
 cd ..
 git clone https://github.com/unitreerobotics/unitree_sdk2_python.git
