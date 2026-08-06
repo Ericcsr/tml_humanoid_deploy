@@ -398,6 +398,14 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None,
         else:
             try:
                 viewer = mujoco.viewer.launch_passive(model, data, key_callback=elastic_band.MujuocoKeyCallback)
+                # Auto-center the camera on the robot: a tracking camera follows the
+                # torso body so the robot stays centered as it moves through the world.
+                try:
+                    viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                    viewer.cam.trackbodyid = model.body("torso_link").id
+                    viewer.cam.distance = float(config.get("camera_distance", 3.0))
+                except Exception as ce:
+                    print(f"[run_simulation] camera tracking setup failed: {ce}", flush=True)
                 print(f"[run_simulation] native MuJoCo viewer launched on DISPLAY={os.environ['DISPLAY']}", flush=True)
             except Exception as e:
                 print(f"[run_simulation] viewer launch failed: {e}", flush=True)
@@ -424,6 +432,16 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None,
         kp = np.array(config['joint_stiffness'], dtype=np.float32)
         kd = np.array(config['joint_damping'], dtype=np.float32)
         torque_limit = np.array(config['torque_limit'], dtype=np.float32)
+
+        # --init_at_ref: the robot is already spawned exactly at the reference start
+        # frame. Disable the elastic band (no gantry) and pre-load the PD target with
+        # the reference joints so the very first sim steps hold that pose instead of
+        # sagging toward zero before the parent commands anything.
+        if config.get("init_at_ref", False):
+            elastic_band.disable_band()
+            with control_lock:
+                control[:29] = data.qpos[7:36].copy()
+                control[29] = 200.0  # mark band-released so it stays disabled
 
         model.opt.timestep = config.get("simulation_dt", 0.005)
         slow_down = config.get("slow_down", 1.0)
@@ -1198,6 +1216,14 @@ class MujocoRobot:
             time.sleep(1.0)
         else:
             input("Press Enter to continue...")
+
+    def begin_at_reference(self, q):
+        """Init-at-reference start: command the reference joints and go, with no PD
+        ramp and no Press-Enter. The sim child already spawned the robot exactly at the
+        reference start frame with the elastic band disabled, so the policy can begin
+        immediately from ~zero frame-0 tracking error."""
+        self.pd_control(q)
+        self.init_q = q.copy()
         
     def damping_state(self):
         self.pd_control(DAMPING)

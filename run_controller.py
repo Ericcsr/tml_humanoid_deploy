@@ -108,13 +108,19 @@ def _align_robot_point(policy, world_pos, init_offset, heading_align_rot):
 
 
 def main(env, policy, config, ticker_value=None, compute_metrics_flag=False,
-         eef_error_flag=False, eef_fk=None):
+         eef_error_flag=False, eef_fk=None, init_at_ref=False):
 
     if config["use_root_state"] and config.get("use_odom", False):
         redis_client = redis.Redis(host=REDIS_IP, port=REDIS_PORT, db=0)
 
-    env.set_robot_state(policy.get_q_init())
-    env.maintain_state(policy.get_q_init())
+    if init_at_ref:
+        # Robot is already spawned exactly at the reference start frame with the band
+        # disabled; just command the reference joints (no ramp, no Press-Enter) so the
+        # policy starts from ~zero frame-0 error.
+        env.begin_at_reference(policy.get_q_init())
+    else:
+        env.set_robot_state(policy.get_q_init())
+        env.maintain_state(policy.get_q_init())
 
     control_dt = config.get("control_dt", 0.02)
     slow_down = config.get("slow_down", 1.0)
@@ -277,6 +283,7 @@ if __name__ == "__main__":
     parser.add_argument("--net", type=str, required=False, help="Network interface for the robot controller.")
     parser.add_argument("--metric", action="store_true", help="Compute mean joint/root errors vs reference during rollout, then exit.")
     parser.add_argument("--vis_ref", action="store_true", help="Show the reference motion in a MuJoCo viewer alongside the robot (sim only).")
+    parser.add_argument("--init_at_ref", action="store_true", help="Spawn the robot exactly at the reference start frame (root + joints), no elastic band and no ramp/pause, then start the policy immediately (sim only). Guarantees ~zero frame-0 tracking error.")
     parser.add_argument("--eef_error", action="store_true", help="Record left/right end-effector (hand) GT vs real poses and save an error plot PNG, then exit.")
     parser.add_argument("--eef_error_png", type=str, default="eef_error.png", help="Output path for the --eef_error plot PNG.")
     parser.add_argument("--slow_down", type=float, default=1.0, help="Slow down simulation and policy by x times (does not affect simulation_dt).")
@@ -333,6 +340,9 @@ if __name__ == "__main__":
         or (has_terrain_box and args.use_sim)
         or (has_terrain_wedge and args.use_sim)
         or (has_object and args.use_sim)
+        # --init_at_ref forces the world-frame (first-frame) spawn even on flat/freespace,
+        # so the robot starts exactly on the reference and the policy runs un-recentered.
+        or (args.init_at_ref and args.use_sim)
     )
     slow_motion_end_frame = config.get("slow_motion_end_frame", None)
     slow_down_times = config.get("slow_down_times", None)
@@ -373,6 +383,13 @@ if __name__ == "__main__":
             config["show_reference_ghost"] = True
             # Match the policy's frame choice so the ghost lines up with the robot.
             config["init_at_first_frame_ghost"] = init_at_first_frame
+
+        # --init_at_ref: tell the sim child to spawn exactly on the reference start frame,
+        # disable the elastic band, and hold the reference joints from step 0 (no ramp).
+        if args.init_at_ref:
+            if config.get("sim_init_joint_pos") is None:
+                raise ValueError("--init_at_ref requires a ref_motion_path in the config.")
+            config["init_at_ref"] = True
 
         ticker_value = Value("f", float(config["ref_motion_start_index"]))
         env = MujocoRobot(config["mujoco_xml_path"], config, ticker_value=ticker_value, session_id=args.session_id)
@@ -511,6 +528,7 @@ if __name__ == "__main__":
             compute_metrics_flag=args.metric,
             eef_error_flag=args.eef_error,
             eef_fk=eef_fk,
+            init_at_ref=args.init_at_ref,
         )
         if result:
             if args.metric and "robot_traj" in result:
