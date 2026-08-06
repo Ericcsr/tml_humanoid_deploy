@@ -27,6 +27,7 @@ see merge_free_box_into_scene_xml.
 """
 import os
 import re
+import copy
 import math
 import xml.etree.ElementTree as ET
 import numpy as np
@@ -983,6 +984,112 @@ def merge_terrain_into_scene_from_string(
         scene_xml = scene_xml[:insert_pos] + "\n" + body_xml + "\n    " + scene_xml[insert_pos:]
 
     return scene_xml
+
+
+def _resolve_scene_include_path(scene_xml_path: str, scene_xml: str) -> Optional[str]:
+    """Return the absolute path of the robot MJCF pulled in by the scene's <include>."""
+    m = re.search(r'<include\s+file="([^"]+)"', scene_xml)
+    if not m:
+        return None
+    inc = m.group(1)
+    if os.path.isabs(inc):
+        return inc
+    # The scene's compiler (and MuJoCo) resolve include paths relative to the CWD
+    # the process runs from (repo root), which is also how this scene is loaded.
+    cand = os.path.normpath(os.path.join(os.getcwd(), inc))
+    if os.path.exists(cand):
+        return cand
+    # Fallback: relative to the scene file's own directory.
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(scene_xml_path)), inc))
+
+
+# Prefix applied to every ghost body / joint name so it can't collide with the
+# real robot's names in the merged model.
+REFERENCE_GHOST_PREFIX = "ref_"
+REFERENCE_GHOST_ROOT_BODY = "ref_pelvis"
+REFERENCE_GHOST_FREEJOINT = "ref_floating_base_joint"
+
+
+def build_reference_ghost_body_xml(
+    robot_mjcf_path: str,
+    rgba: Tuple[float, float, float, float] = (0.2, 0.8, 0.2, 0.35),
+) -> str:
+    """Build a collision-free, transparent duplicate of the robot's body tree.
+
+    Reads the robot MJCF (the file the scene ``<include>``s), deep-copies the root
+    (pelvis) body subtree, and returns a worldbody ``<body>`` fragment that:
+      * prefixes every body/joint name with ``ref_`` (no name clash with the real robot),
+      * keeps the ``childclass="g1"`` joint defaults so joint axes/order match,
+      * drops all collision geoms (``class="collision"``) and sites,
+      * recolors every visual geom to a single translucent ``rgba`` (the ghost look),
+      * has NO actuators (driven kinematically via qpos, not torque).
+
+    The ghost keeps its free joint, so it appears in qpos after the real robot when
+    merged last -- the caller drives ``ref_*`` qpos from the reference motion.
+    """
+    tree = ET.parse(robot_mjcf_path)
+    root = tree.getroot()
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise ValueError(f"No <worldbody> in robot MJCF: {robot_mjcf_path}")
+    pelvis = worldbody.find("body")
+    if pelvis is None:
+        raise ValueError(f"No root body in robot MJCF worldbody: {robot_mjcf_path}")
+
+    ghost = copy.deepcopy(pelvis)
+
+    # Prefix body + joint names; the freejoint too.
+    for body in ghost.iter("body"):
+        if body.get("name"):
+            body.set("name", REFERENCE_GHOST_PREFIX + body.get("name"))
+    for jtag in ("joint", "freejoint"):
+        for j in ghost.iter(jtag):
+            if j.get("name"):
+                j.set("name", REFERENCE_GHOST_PREFIX + j.get("name"))
+
+    # Remove collision geoms and all sites (visual-only ghost). Iterate over each
+    # body's direct children so we can delete in place.
+    r, g, b, a = (float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3]))
+    ghost_rgba = f"{r} {g} {b} {a}"
+    for body in ghost.iter("body"):
+        for child in list(body):
+            if child.tag == "site":
+                body.remove(child)
+            elif child.tag == "geom":
+                if child.get("class") == "collision":
+                    body.remove(child)
+                else:
+                    # Visual geom: force the ghost color, drop any per-geom material
+                    # so rgba (incl. alpha) actually shows through.
+                    child.set("rgba", ghost_rgba)
+                    if "material" in child.attrib:
+                        del child.attrib["material"]
+
+    return ET.tostring(ghost, encoding="unicode")
+
+
+def merge_reference_ghost_into_scene_xml(
+    scene_xml: str,
+    scene_xml_path: str,
+    rgba: Tuple[float, float, float, float] = (0.2, 0.8, 0.2, 0.35),
+) -> str:
+    """Merge a transparent, collision-free ghost of the robot into the scene.
+
+    The ghost is appended LAST in the worldbody so the real robot keeps qpos
+    indices 0-35 / qvel 0-34; the ghost's free joint + 29 joints follow it.
+    """
+    robot_mjcf = _resolve_scene_include_path(scene_xml_path, scene_xml)
+    if robot_mjcf is None or not os.path.exists(robot_mjcf):
+        raise FileNotFoundError(
+            f"Could not resolve the robot MJCF <include> for the reference ghost "
+            f"(scene: {scene_xml_path})"
+        )
+    ghost_body_xml = build_reference_ghost_body_xml(robot_mjcf, rgba=rgba)
+    # Insert before </worldbody> so the ghost is the last body (indices after robot).
+    worldbody_end = scene_xml.rfind("</worldbody>")
+    if worldbody_end < 0:
+        raise ValueError("scene_xml has no </worldbody> to merge the reference ghost into")
+    return scene_xml[:worldbody_end] + "\n" + ghost_body_xml + "\n  " + scene_xml[worldbody_end:]
 
 
 def merge_terrain_into_scene(

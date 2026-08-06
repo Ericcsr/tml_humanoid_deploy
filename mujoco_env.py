@@ -207,6 +207,60 @@ def _object_hand_center_world_pos(data, left_wrist_body_id, right_wrist_body_id,
     return (left_p + right_p) * 0.5
 
 
+class _ReferenceGhostDriver:
+    """Drive the merged reference-ghost qpos from the reference motion each frame.
+
+    Reproduces the policy's init-relative transform (origin at the start frame's
+    root, yaw-aligned) so the ghost lines up with the physically-simulated robot,
+    then writes root pose + joint angles into the ghost's qpos block.
+    """
+
+    def __init__(self, model, config):
+        from utils.params import ISAAC_TO_MUJOCO
+
+        self._isaac_to_mujoco = ISAAC_TO_MUJOCO
+        ref_motion = np.load(config["ref_motion_path"])
+        self.ref_joint_pos = ref_motion["joint_pos"].copy()
+        self.ref_root_pos = ref_motion["body_pos_w"][:, 0].copy()
+        self.ref_root_quat_wxyz = ref_motion["body_quat_w"][:, 0].copy()
+        self.motion_length = self.ref_joint_pos.shape[0]
+
+        si = int(config.get("ref_motion_start_index", 0))
+        si = max(0, min(si, self.motion_length - 1))
+
+        if config.get("init_at_first_frame_ghost", False) or (
+            config.get("sim_init_root_pos") is not None
+        ):
+            # Robot is placed in the world at the start frame (terrain/object): use the
+            # world frame directly, matching the policy's init_at_first_frame branch.
+            self.init_root_pos = np.zeros(3)
+            self.init_heading_inv = Rotation.identity()
+        else:
+            self.init_root_pos = self.ref_root_pos[si].copy()
+            self.init_root_pos[2] = 0.0
+            self.init_heading_inv = Rotation.from_quat(
+                yaw_quat(self.ref_root_quat_wxyz[si])[[1, 2, 3, 0]]
+            ).inv()
+
+        # qpos layout for the ghost free joint (root) + 29 joints.
+        jid = model.joint("ref_floating_base_joint").id
+        self.root_qposadr = int(model.jnt_qposadr[jid])
+        self.joint_qposadr = self.root_qposadr + 7
+
+    def drive(self, data, ticker):
+        mid = int(ticker) if ticker < self.motion_length else self.motion_length - 1
+        mid = max(0, mid)
+        # Root pose -> init-relative frame (same as policy / ref visualizer).
+        rel_pos = self.init_heading_inv.apply(self.ref_root_pos[mid] - self.init_root_pos)
+        ref_orn_xyzw = self.ref_root_quat_wxyz[mid][[1, 2, 3, 0]]
+        rel_orn = (self.init_heading_inv * Rotation.from_quat(ref_orn_xyzw)).as_quat()  # xyzw
+        data.qpos[self.root_qposadr:self.root_qposadr + 3] = rel_pos
+        data.qpos[self.root_qposadr + 3:self.root_qposadr + 7] = rel_orn[[3, 0, 1, 2]]  # wxyz
+        data.qpos[self.joint_qposadr:self.joint_qposadr + 29] = (
+            self.ref_joint_pos[mid][self._isaac_to_mujoco]
+        )
+
+
 def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None, session_id=None):
         # session_id (optional): when set, all redis keys + shared-memory blocks
         # used by this controller are suffixed with `:{session_id}` so multiple
@@ -305,6 +359,23 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None,
                 object_body_id = None
                 left_wrist_body_id = None
                 right_wrist_body_id = None
+
+        # Reference ghost: kinematically drive the merged ghost from the reference motion.
+        ghost_driver = None
+        if config.get("show_reference_ghost", False):
+            try:
+                ghost_driver = _ReferenceGhostDriver(model, config)
+                if ticker_value is not None:
+                    ghost_driver.drive(data, ticker_value.value)
+                mujoco.mj_forward(model, data)
+                print(
+                    f"[run_simulation] Reference ghost driver active "
+                    f"({ghost_driver.motion_length} frames)",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[run_simulation] Reference ghost init failed: {e}", flush=True)
+                ghost_driver = None
 
         redis_client = redis.Redis(host=REDIS_IP, port=REDIS_PORT, db=0)
 
@@ -441,6 +512,12 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None,
                     data.qpos[object_qposadr + 3:object_qposadr + 7] = object_quat_wxyz[frame_idx]
                     data.qvel[object_dofadr:object_dofadr + 6] = 0.0
                     mujoco.mj_forward(model, data)
+
+            # Reference ghost: kinematically follow the reference motion at the current ticker.
+            if ghost_driver is not None and ticker_value is not None:
+                ghost_driver.drive(data, ticker_value.value)
+                mujoco.mj_forward(model, data)
+
             with data_lock:
                 q[:] = data.qpos[7:36].copy()
                 dq[:] = data.qvel[6:35].copy()
@@ -1022,6 +1099,32 @@ class MujocoRobot:
                     os.unlink(obj_temp)
                 raise
             print(f"[MujocoRobot] Object loaded from {object_path}", flush=True)
+
+        # Reference ghost: a transparent, collision-free copy of the robot, added LAST
+        # (after robot/terrain/object) so the real robot keeps qpos 0-35. Its joints are
+        # driven kinematically from the reference motion inside run_simulation().
+        if config.get("show_reference_ghost", False):
+            from utils.urdf_to_mujoco import merge_reference_ghost_into_scene_xml
+            with open(xml_path_to_load, "r") as f:
+                scene_xml = f.read()
+            ghost_rgba = config.get("reference_ghost_rgba", (0.2, 0.8, 0.2, 0.35))
+            merged_xml = merge_reference_ghost_into_scene_xml(
+                scene_xml, xml_path, rgba=ghost_rgba
+            )
+            fd_ghost, ghost_temp = tempfile.mkstemp(suffix=".xml", prefix="mujoco_scene_ghost_")
+            try:
+                with os.fdopen(fd_ghost, "w") as f:
+                    f.write(merged_xml)
+                if self._terrain_temp_file:
+                    os.unlink(self._terrain_temp_file)
+                self._terrain_temp_file = ghost_temp
+                xml_path_to_load = ghost_temp
+            except Exception:
+                os.close(fd_ghost)
+                if os.path.exists(ghost_temp):
+                    os.unlink(ghost_temp)
+                raise
+            print("[MujocoRobot] Reference ghost merged (transparent, collision-free)", flush=True)
 
         self.control_var = shared_np(30, "control", np.float32, session_id=session_id)
         self.q_var = shared_np(29, "q", np.float32, session_id=session_id)

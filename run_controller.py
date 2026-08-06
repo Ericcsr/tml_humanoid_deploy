@@ -73,8 +73,43 @@ def compute_metrics(robot_state, policy, mid, init_offset=None):
     return joint_err, root_pos_err, root_orn_err, robot_rel_pos.copy(), ref_rel_pos.copy()
 
 
-def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
-    
+# Reference-motion body names for the left / right hand end effectors. Resolved to
+# column indices from the motion's ``body_names`` at runtime (fallback 28/29).
+REF_LEFT_HAND_BODY = "left_wrist_yaw_link"
+REF_RIGHT_HAND_BODY = "right_wrist_yaw_link"
+
+
+def _ref_hand_indices(policy):
+    """(left, right) hand body column indices in policy.ref_motion['body_pos_w']."""
+    ref_motion = policy.ref_motion
+    if "body_names" in getattr(ref_motion, "files", []) or (
+        isinstance(ref_motion, dict) and "body_names" in ref_motion
+    ):
+        names = [str(n) for n in np.asarray(ref_motion["body_names"])]
+        return names.index(REF_LEFT_HAND_BODY), names.index(REF_RIGHT_HAND_BODY)
+    return 28, 29
+
+
+def _to_init_relative(policy, world_pos):
+    """World point -> init-relative frame (origin at init_root_pos, yaw-aligned)."""
+    return policy.init_root_heading_inv.apply(world_pos - policy.init_root_pos)
+
+
+def _align_robot_point(policy, world_pos, init_offset, heading_align_rot):
+    """Robot world point -> init-relative frame with the same first-frame alignment
+    (position offset + heading rotation) applied to the root trajectory, so robot
+    and reference are directly comparable."""
+    rel = _to_init_relative(policy, world_pos)
+    pos_offset, _, ref_rel_pos_0 = init_offset
+    rel = rel - pos_offset
+    if heading_align_rot is not None:
+        rel = ref_rel_pos_0 + heading_align_rot.apply(rel - ref_rel_pos_0)
+    return rel
+
+
+def main(env, policy, config, ticker_value=None, compute_metrics_flag=False,
+         eef_error_flag=False, eef_fk=None):
+
     if config["use_root_state"] and config.get("use_odom", False):
         redis_client = redis.Redis(host=REDIS_IP, port=REDIS_PORT, db=0)
 
@@ -105,9 +140,14 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
     # Accumulators for metrics (when --metric enabled)
     joint_errors, root_pos_errors, root_orn_errors = [], [], []
     robot_traj, ref_traj = [], []  # root trajectories for visualization
+    # End-effector (hand) world-position accumulators (when --eef_error enabled)
+    robot_lhand, ref_lhand, robot_rhand, ref_rhand = [], [], [], []
     motion_length = policy.motion_length
-    init_offset = None  # alignment from ref_motion_start_index frame when --metric
+    init_offset = None  # alignment from ref_motion_start_index frame when --metric/--eef_error
     heading_align_rot = None  # rotation to align robot's initial heading with ref (removes heading-induced xy drift)
+    track_flag = compute_metrics_flag or eef_error_flag
+    if eef_error_flag:
+        ref_lhand_idx, ref_rhand_idx = _ref_hand_indices(policy)
 
     while True:
         
@@ -146,7 +186,7 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
         # Compute metrics: robot state is from start of loop (after prev step); ticker was just incremented.
         # So robot = result of (ticker-1) steps, ref frame (ticker-1) is the one we used for that action.
         # Requires use_root_state for root_pos/root_orn.
-        if compute_metrics_flag and config["use_root_state"]:
+        if track_flag and config["use_root_state"]:
             si = getattr(policy, "ref_motion_start_index", 0)
             if policy.ticker > si:
                 mid = policy.ticker - 1
@@ -166,32 +206,61 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
                 # Heading alignment: rotate robot's displacement so initial heading matches ref (removes xy drift)
                 heading_diff = heading_zup(robot_rel_orn_0) - heading_zup(ref_rel_orn_0)
                 heading_align_rot = Rotation.from_euler("z", -heading_diff)
-            je, rpe, roe, robot_pos, ref_pos = compute_metrics(robot_state, policy, mid, init_offset)
-            joint_errors.append(je)
-            root_pos_errors.append(rpe)
-            root_orn_errors.append(roe)
-            # Apply heading alignment to robot trajectory (robot_pos already has pos_offset applied)
-            if heading_align_rot is not None:
-                _, _, ref_rel_pos_0 = init_offset
-                robot_disp = robot_pos - ref_rel_pos_0
-                robot_pos_aligned = ref_rel_pos_0 + heading_align_rot.apply(robot_disp)
-                robot_traj.append(robot_pos_aligned)
-            else:
-                robot_traj.append(robot_pos)
-            ref_traj.append(ref_pos)
+
+            if compute_metrics_flag:
+                je, rpe, roe, robot_pos, ref_pos = compute_metrics(robot_state, policy, mid, init_offset)
+                joint_errors.append(je)
+                root_pos_errors.append(rpe)
+                root_orn_errors.append(roe)
+                # Apply heading alignment to robot trajectory (robot_pos already has pos_offset applied)
+                if heading_align_rot is not None:
+                    _, _, ref_rel_pos_0 = init_offset
+                    robot_disp = robot_pos - ref_rel_pos_0
+                    robot_pos_aligned = ref_rel_pos_0 + heading_align_rot.apply(robot_disp)
+                    robot_traj.append(robot_pos_aligned)
+                else:
+                    robot_traj.append(robot_pos)
+                ref_traj.append(ref_pos)
+
+            # End-effector tracking: robot hand poses via FK vs reference-motion hand poses,
+            # both mapped to the init-relative frame with the same first-frame alignment.
+            if eef_error_flag and eef_fk is not None and init_offset is not None:
+                l_pos_w, _, r_pos_w, _ = eef_fk.hand_world_poses(
+                    robot_state.q, robot_state.root_pos, robot_state.root_orn
+                )
+                robot_lhand.append(_align_robot_point(policy, l_pos_w, init_offset, heading_align_rot))
+                robot_rhand.append(_align_robot_point(policy, r_pos_w, init_offset, heading_align_rot))
+                ref_lhand.append(_to_init_relative(policy, policy.ref_motion["body_pos_w"][mid, ref_lhand_idx]))
+                ref_rhand.append(_to_init_relative(policy, policy.ref_motion["body_pos_w"][mid, ref_rhand_idx]))
+
             if policy.ticker >= motion_length:
-                mean_je = np.mean(joint_errors)
-                # Use same trajectory data as plot (heading-aligned robot vs ref) for printed metric
-                robot_arr = np.array(robot_traj)
-                ref_arr = np.array(ref_traj)
-                mean_rpe = np.mean(np.linalg.norm(robot_arr - ref_arr, axis=1))
-                mean_roe = np.mean(root_orn_errors)
-                print("\n=== Motion Rollout Metrics ===")
-                print(f"  Mean joint error (rad):     {mean_je:.6f}")
-                print(f"  Mean root position error (m): {mean_rpe:.6f}")
-                print(f"  Mean root orientation error (rad): {mean_roe:.6f}")
-                print("==============================\n")
-                return robot_arr, ref_arr
+                result = {}
+                if compute_metrics_flag:
+                    mean_je = np.mean(joint_errors)
+                    # Use same trajectory data as plot (heading-aligned robot vs ref) for printed metric
+                    robot_arr = np.array(robot_traj)
+                    ref_arr = np.array(ref_traj)
+                    mean_rpe = np.mean(np.linalg.norm(robot_arr - ref_arr, axis=1))
+                    mean_roe = np.mean(root_orn_errors)
+                    print("\n=== Motion Rollout Metrics ===")
+                    print(f"  Mean joint error (rad):     {mean_je:.6f}")
+                    print(f"  Mean root position error (m): {mean_rpe:.6f}")
+                    print(f"  Mean root orientation error (rad): {mean_roe:.6f}")
+                    print("==============================\n")
+                    result["robot_traj"] = robot_arr
+                    result["ref_traj"] = ref_arr
+                if eef_error_flag:
+                    rl, rfl = np.array(robot_lhand), np.array(ref_lhand)
+                    rr, rfr = np.array(robot_rhand), np.array(ref_rhand)
+                    mean_le = np.mean(np.linalg.norm(rl - rfl, axis=1)) if len(rl) else float("nan")
+                    mean_re = np.mean(np.linalg.norm(rr - rfr, axis=1)) if len(rr) else float("nan")
+                    print("=== End-Effector Tracking Metrics ===")
+                    print(f"  Mean left hand position error (m):  {mean_le:.6f}")
+                    print(f"  Mean right hand position error (m): {mean_re:.6f}")
+                    print("=====================================\n")
+                    result["robot_lhand"], result["ref_lhand"] = rl, rfl
+                    result["robot_rhand"], result["ref_rhand"] = rr, rfr
+                return result
 
         robot_state.last_action = action.copy() # save last action
 
@@ -207,6 +276,9 @@ if __name__ == "__main__":
     parser.add_argument("--vr", action="store_true", default=False, help="Use 3-point VR controller.")
     parser.add_argument("--net", type=str, required=False, help="Network interface for the robot controller.")
     parser.add_argument("--metric", action="store_true", help="Compute mean joint/root errors vs reference during rollout, then exit.")
+    parser.add_argument("--vis_ref", action="store_true", help="Show the reference motion in a MuJoCo viewer alongside the robot (sim only).")
+    parser.add_argument("--eef_error", action="store_true", help="Record left/right end-effector (hand) GT vs real poses and save an error plot PNG, then exit.")
+    parser.add_argument("--eef_error_png", type=str, default="eef_error.png", help="Output path for the --eef_error plot PNG.")
     parser.add_argument("--slow_down", type=float, default=1.0, help="Slow down simulation and policy by x times (does not affect simulation_dt).")
     parser.add_argument("--session-id", type=str, default=None, help="Per-session suffix for redis keys + shared-memory blocks. Used by spawn_server.py for per-user isolation; leave unset for the default single-sim path.")
     args = parser.parse_args()
@@ -223,6 +295,8 @@ if __name__ == "__main__":
 
     if args.metric and not config.get("use_root_state", False):
         raise ValueError("--metric requires use_root_state: True in config (for root position/orientation).")
+    if args.eef_error and not config.get("use_root_state", False):
+        raise ValueError("--eef_error requires use_root_state: True in config (for root position/orientation).")
 
     if args.slow_down != 1.0:
         print(f"[run_controller] Slow down: {args.slow_down}x (simulation_dt unchanged)", flush=True)
@@ -292,26 +366,20 @@ if __name__ == "__main__":
 
     if args.use_sim:
         from mujoco_env import MujocoRobot
-        from ref_motion_visualizer import start_ref_visualizer_process
+
+        # Show the reference motion as a transparent, collision-free ghost in the SAME
+        # viewer when explicitly requested (--vis_ref) or a comparison flag is enabled.
+        if (args.metric or args.vis_ref or args.eef_error) and config.get("ref_motion_path"):
+            config["show_reference_ghost"] = True
+            # Match the policy's frame choice so the ghost lines up with the robot.
+            config["init_at_first_frame_ghost"] = init_at_first_frame
 
         ticker_value = Value("f", float(config["ref_motion_start_index"]))
         env = MujocoRobot(config["mujoco_xml_path"], config, ticker_value=ticker_value, session_id=args.session_id)
-        # Only start ref motion visualizer when --metric is enabled
-        if args.metric:
-            ref_vis_process = start_ref_visualizer_process(
-                config["mujoco_xml_path"],
-                config["ref_motion_path"],
-                control_dt=config.get("control_dt", 0.02),
-                ticker_value=ticker_value,
-                ref_motion_start_index=config["ref_motion_start_index"],
-            )
-        else:
-            ref_vis_process = None
     else:
         from real_env import UnitreeRobot
         env = UnitreeRobot(args.net, config)
         ticker_value = None
-        ref_vis_process = None
 
     lookahead_steps = config.get("lookahead_steps",1)
     lookahead_frame_skips = config.get("lookahead_frame_skips",1)
@@ -430,13 +498,31 @@ if __name__ == "__main__":
             slow_down_times=slow_down_times,
         )
 
+    # Forward-kinematics helper for the robot's achieved hand poses (--eef_error).
+    eef_fk = None
+    if args.eef_error:
+        from eef_tracker import HandForwardKinematics
+        eef_fk = HandForwardKinematics(config["mujoco_xml_path"])
+
     try:
-        result = main(env, policy, config, ticker_value=ticker_value, compute_metrics_flag=args.metric)
-        if result is not None and args.metric:
-            robot_traj, ref_traj = result
-            from trajectory_visualizer import plot_root_trajectories
-            plot_root_trajectories(robot_traj, ref_traj)
+        result = main(
+            env, policy, config,
+            ticker_value=ticker_value,
+            compute_metrics_flag=args.metric,
+            eef_error_flag=args.eef_error,
+            eef_fk=eef_fk,
+        )
+        if result:
+            if args.metric and "robot_traj" in result:
+                from trajectory_visualizer import plot_root_trajectories
+                plot_root_trajectories(result["robot_traj"], result["ref_traj"])
+            if args.eef_error and "robot_lhand" in result:
+                from trajectory_visualizer import plot_eef_errors
+                plot_eef_errors(
+                    result["robot_lhand"], result["ref_lhand"],
+                    result["robot_rhand"], result["ref_rhand"],
+                    output_png=args.eef_error_png,
+                )
     finally:
-        if ref_vis_process is not None:
-            ref_vis_process.terminate()
-            ref_vis_process.join()
+        if args.use_sim and hasattr(env, "close"):
+            env.close()
