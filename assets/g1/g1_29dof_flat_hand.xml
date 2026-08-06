@@ -115,9 +115,11 @@
     <mesh name="right_wrist_pitch_link" file="right_wrist_pitch_link.STL" />
     <mesh name="right_wrist_yaw_link" file="right_wrist_yaw_link.STL" />
     <mesh name="right_rubber_hand" file="right_rubber_hand.STL" />
+    <mesh name="backpack_v1" file="backpack_v1.stl" />
 
     <material name="silver" rgba="0.7 0.7 0.7 1"/>
     <material name="black" rgba="0.2 0.2 0.2 1"/>
+    <material name="dark_grey" rgba="0.3 0.3 0.3 1"/>
   </asset>
 
   <worldbody>
@@ -240,6 +242,13 @@
                         <geom class="visual" mesh="torso_link"/>
                         <geom pos="0.0039635 0 -0.044" quat="1 0 0 0" class="visual" material="black" mesh="logo_link"/>
                         <geom pos="0.0039635 0 -0.044" class="visual" material="black" mesh="head_link"/>
+
+                        <!-- <body name="backpack_v1_link" pos="-0.071407 -0.000003 0.118824">
+                            <inertial pos="-0.043273 -0.000634 0.003192" mass="2.893"
+                                      fullinertia="0.026913 0.023204 0.012182 0.000029 0.000439 -0.000302"/>
+                            <geom class="visual" material="dark_grey" mesh="backpack_v1"/>
+                            <geom name="backpack_collision" class="collision" type="box" size="0.06 0.1 0.15155" pos="-0.04897 -0.00005 0.01185"/>
+                        </body> -->
 
                         <geom name="torso_collision1" class="collision" type="capsule" size="0.073" fromto="0.005 -0.032 .22 0.005 0.032 .22"/>
                         <geom name="torso_collision2" class="collision" type="capsule" size="0.07" fromto="0.005 -0.028 .13 0.005 0.028 .13"/>
