@@ -108,7 +108,7 @@ def _align_robot_point(policy, world_pos, init_offset, heading_align_rot):
 
 
 def main(env, policy, config, ticker_value=None, compute_metrics_flag=False,
-         eef_error_flag=False, eef_fk=None, init_at_ref=False):
+         eef_error_flag=False, eef_fk=None, init_at_ref=False, hold_frame0_sec=0.0):
 
     if config["use_root_state"] and config.get("use_odom", False):
         redis_client = redis.Redis(host=REDIS_IP, port=REDIS_PORT, db=0)
@@ -155,6 +155,15 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False,
     if eef_error_flag:
         ref_lhand_idx, ref_rhand_idx = _ref_hand_indices(policy)
 
+    # Hold at frame 0: run the policy (so it actively balances) but freeze the reference
+    # ticker for the first hold_frame0_sec seconds, letting the robot settle before the
+    # motion starts advancing.
+    hold_frame0_steps = int(round(hold_frame0_sec / control_dt)) if hold_frame0_sec > 0 else 0
+    step_count = 0
+    if hold_frame0_steps > 0:
+        print(f"[run_controller] Holding at frame 0 for {hold_frame0_sec:g}s "
+              f"({hold_frame0_steps} steps) before advancing the reference.", flush=True)
+
     while True:
         
         robot_state.q, robot_state.dq, robot_state.imu_quat, robot_state.omega = env.get_robot_state()
@@ -183,7 +192,10 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False,
         control_signals = policy.prepare_control_signals(robot_state)
         obs = policy.prepare_obs(robot_state, control_signals) # Should be reference motion.
         
-        action = policy.get_action(obs, start_ticker=env.get_start_ticker())
+        # Freeze the ticker during the frame-0 hold window, then advance normally.
+        advance_ticker = env.get_start_ticker() and (step_count >= hold_frame0_steps)
+        action = policy.get_action(obs, start_ticker=advance_ticker)
+        step_count += 1
 
         # Sync ticker to ref motion visualizer (when use_sim)
         if ticker_value is not None:
@@ -284,6 +296,7 @@ if __name__ == "__main__":
     parser.add_argument("--metric", action="store_true", help="Compute mean joint/root errors vs reference during rollout, then exit.")
     parser.add_argument("--vis_ref", action="store_true", help="Show the reference motion in a MuJoCo viewer alongside the robot (sim only).")
     parser.add_argument("--init_at_ref", action="store_true", help="Spawn the robot exactly at the reference start frame (root + joints), no elastic band and no ramp/pause, then start the policy immediately (sim only). Guarantees ~zero frame-0 tracking error.")
+    parser.add_argument("--hold_frame0_sec", type=float, default=0.0, help="Hold at the reference frame 0 for this many seconds (policy runs to balance, reference ticker frozen) before the motion starts advancing, so the robot settles and does not fall at frame 0.")
     parser.add_argument("--eef_error", action="store_true", help="Record left/right end-effector (hand) GT vs real poses and save an error plot PNG, then exit.")
     parser.add_argument("--eef_error_png", type=str, default="eef_error.png", help="Output path for the --eef_error plot PNG.")
     parser.add_argument("--slow_down", type=float, default=1.0, help="Slow down simulation and policy by x times (does not affect simulation_dt).")
@@ -529,6 +542,7 @@ if __name__ == "__main__":
             eef_error_flag=args.eef_error,
             eef_fk=eef_fk,
             init_at_ref=args.init_at_ref,
+            hold_frame0_sec=args.hold_frame0_sec,
         )
         if result:
             if args.metric and "robot_traj" in result:
