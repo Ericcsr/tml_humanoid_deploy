@@ -4,13 +4,10 @@
 			"path": "."
 		},
 		{
-			"path": "../contact_terrain_reconstruction"
-		},
-		{
 			"path": "../tml_humanoid_eval"
 		},
 		{
-			"path": "../robot_motion_stitching"
+			"path": "../GR00T-WholeBodyControl/gear_sonic_deploy"
 		}
 	],
 	"settings": {}

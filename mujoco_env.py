@@ -315,6 +315,8 @@ def run_simulation(control_lock, data_lock, xml_path, config, ticker_value=None)
         torque_limit = np.array(config['torque_limit'], dtype=np.float32)
 
         model.opt.timestep = config.get("simulation_dt", 0.005)
+        if "mujoco_impratio" in config and config["mujoco_impratio"] is not None:
+            model.opt.impratio = float(config["mujoco_impratio"])
         slow_down = config.get("slow_down", 1.0)
         rate = Rate(1 / (model.opt.timestep * slow_down))
         # Redis SLAM mimic: pose + world-frame velocities (see run_state_estimation_slam_only / robot_model)
@@ -660,6 +662,7 @@ class MujocoRobot:
                 use_columns_for_collision=use_columns_for_collision,
                 terrain_column_res=config.get("terrain_column_res", 0.2),
                 terrain_floor_threshold=config.get("terrain_floor_threshold", 0.02),
+                terrain_column_xy_scale=config.get("terrain_column_xy_scale", 1.0),
                 terrain_urdf_offset=terrain_urdf_offset,
             )
             scene_dirty = True
@@ -727,7 +730,13 @@ class MujocoRobot:
                 raise FileNotFoundError(f"object_urdf not found: {object_path}")
             with open(xml_path_to_load, "r") as f:
                 scene_xml = f.read()
-            merged_xml = merge_object_into_scene(scene_xml, object_path)
+            merged_xml = merge_object_into_scene(
+                scene_xml,
+                object_path,
+                object_mass=config.get("object_mass", None),
+                object_friction=config.get("object_friction", None),
+                object_box_extra_height=config.get("object_box_extra_height", 0.0),
+            )
             fd_obj, obj_temp = tempfile.mkstemp(
                 suffix=".xml",
                 prefix="mujoco_scene_obj_",

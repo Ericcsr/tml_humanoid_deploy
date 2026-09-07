@@ -1,0 +1,159 @@
+# GEAR-SONIC terrain evaluation config for run_mujoco_eval.py
+#
+# Batch terrain eval (primary mode) — eval_motions_root uses the flat layout:
+#   {stem}_terrain.urdf   (height-map terrain)
+#   {stem}_motion_0.npz   (or {stem}.npz)
+#   {stem}_motion_0_contact_nodes.npy  (optional; not used by gear_sonic)
+#
+# Usage (batch, headless):
+#   cd tml_humanoid_eval
+#   python run_mujoco_eval.py \
+#     --config ../tml_humanoid_deploy/exported_policies/gear_sonic/experiment_gear_sonic_g1_eval_terrain.yaml \
+#     --metric --headless
+#
+# Usage (single motion with viewer — comment out eval_motions_root and set ref_motion_path
+#         + terrain_urdf):
+#   python run_mujoco_eval.py \
+#     --config .../experiment_gear_sonic_g1_eval_terrain.yaml \
+#     --metric --viz-ref-keypoints
+#
+# ONNX models (git-lfs): exported_policies/gear_sonic/model_encoder.onnx + model_decoder.onnx
+
+rl_policy:
+  use_gear_sonic_g1_onnx: True
+  use_streaming_motion: False
+  use_contact: False
+  use_chip: False
+
+  # Split ONNX next to this YAML (tracked with git-lfs).
+  gear_sonic_deploy_policy_dir: "exported_policies/gear_sonic"
+  gear_sonic_encoder_onnx_name: "model_encoder.onnx"
+  gear_sonic_decoder_onnx_name: "model_decoder.onnx"
+
+  # Batch terrain eval: each entry in eval_motions_root must have
+  #   {stem}_terrain.urdf + {stem}_motion_0.npz (flat layout).
+  eval_motions_root: "exported_policies/terrain_eval"
+  # Single-motion mode: comment out eval_motions_root and uncomment below.
+  # ref_motion_path: "exported_policies/amass_stairs/some_stair_motion_0.npz"
+  # terrain_urdf:    "exported_policies/amass_stairs/some_stair_terrain.urdf"
+
+  mujoco_xml_path: "assets/g1/scene_29dof_flat_hand.xml"
+  # False: policy uses IMU orientation + joints only (no privileged/odom root pos or lin vel).
+  # Required for real-robot --net; sim metrics still use privileged root for reporting.
+  use_root_state: False
+
+  # Terrain rendering options (match mujoco_sync_env / mujoco_env)
+  terrain_mesh_collision: False
+  terrain_use_columns: True
+  terrain_column_res: 0.03
+  terrain_column_xy_scale: 1.0
+
+  gear_sonic_num_future_frames: 5
+  lookahead_frame_skips: 1
+  init_at_first_frame: False
+  ref_motion_start_index: 0
+  gear_sonic_num_dof: 29
+
+  gear_sonic_encoder_index: 0.0
+  gear_sonic_omega_is_world_frame: False
+  gear_sonic_apply_heading_alignment: False
+  gear_sonic_use_history_buffer: True
+
+  control_dt: 0.02
+  simulation_dt: 0.005
+
+  joint_stiffness:
+    # Matches gear_sonic_deploy policy_parameters.hpp::kps (Mujoco/hardware order).
+    - 99.0984   # left_hip_pitch_joint
+    - 99.0984   # left_hip_roll_joint
+    - 40.1792   # left_hip_yaw_joint
+    - 99.0984   # left_knee_joint
+    - 28.5012   # left_ankle_pitch_joint
+    - 28.5012   # left_ankle_roll_joint
+    - 99.0984   # right_hip_pitch_joint
+    - 99.0984   # right_hip_roll_joint
+    - 40.1792   # right_hip_yaw_joint
+    - 99.0984   # right_knee_joint
+    - 28.5012   # right_ankle_pitch_joint
+    - 28.5012   # right_ankle_roll_joint
+    - 40.1792   # waist_yaw_joint
+    - 28.5012   # waist_roll_joint
+    - 28.5012   # waist_pitch_joint
+    - 14.2506   # left_shoulder_pitch_joint
+    - 14.2506   # left_shoulder_roll_joint
+    - 14.2506   # left_shoulder_yaw_joint
+    - 14.2506   # left_elbow_joint
+    - 14.2506   # left_wrist_roll_joint
+    - 16.7783   # left_wrist_pitch_joint
+    - 16.7783   # left_wrist_yaw_joint
+    - 14.2506   # right_shoulder_pitch_joint
+    - 14.2506   # right_shoulder_roll_joint
+    - 14.2506   # right_shoulder_yaw_joint
+    - 14.2506   # right_elbow_joint
+    - 14.2506   # right_wrist_roll_joint
+    - 16.7783   # right_wrist_pitch_joint
+    - 16.7783   # right_wrist_yaw_joint
+
+  joint_damping:
+    # Matches gear_sonic_deploy policy_parameters.hpp::kds (Mujoco/hardware order).
+    - 6.3088    # left_hip_pitch_joint
+    - 6.3088    # left_hip_roll_joint
+    - 2.5579    # left_hip_yaw_joint
+    - 6.3088    # left_knee_joint
+    - 1.8144    # left_ankle_pitch_joint
+    - 1.8144    # left_ankle_roll_joint
+    - 6.3088    # right_hip_pitch_joint
+    - 6.3088    # right_hip_roll_joint
+    - 2.5579    # right_hip_yaw_joint
+    - 6.3088    # right_knee_joint
+    - 1.8144    # right_ankle_pitch_joint
+    - 1.8144    # right_ankle_roll_joint
+    - 2.5579    # waist_yaw_joint
+    - 1.8144    # waist_roll_joint
+    - 1.8144    # waist_pitch_joint
+    - 0.9072    # left_shoulder_pitch_joint
+    - 0.9072    # left_shoulder_roll_joint
+    - 0.9072    # left_shoulder_yaw_joint
+    - 0.9072    # left_elbow_joint
+    - 0.9072    # left_wrist_roll_joint
+    - 1.0681    # left_wrist_pitch_joint
+    - 1.0681    # left_wrist_yaw_joint
+    - 0.9072    # right_shoulder_pitch_joint
+    - 0.9072    # right_shoulder_roll_joint
+    - 0.9072    # right_shoulder_yaw_joint
+    - 0.9072    # right_elbow_joint
+    - 0.9072    # right_wrist_roll_joint
+    - 1.0681    # right_wrist_pitch_joint
+    - 1.0681    # right_wrist_yaw_joint
+
+  torque_limit:
+    # Matches gear_sonic_deploy effort limits (Mujoco/hardware order).
+    - 139   # left_hip_pitch_joint
+    - 139   # left_hip_roll_joint
+    - 88    # left_hip_yaw_joint
+    - 139   # left_knee_joint
+    - 25    # left_ankle_pitch_joint
+    - 25    # left_ankle_roll_joint
+    - 139   # right_hip_pitch_joint
+    - 139   # right_hip_roll_joint
+    - 88    # right_hip_yaw_joint
+    - 139   # right_knee_joint
+    - 25    # right_ankle_pitch_joint
+    - 25    # right_ankle_roll_joint
+    - 88    # waist_yaw_joint
+    - 25    # waist_roll_joint
+    - 25    # waist_pitch_joint
+    - 25    # left_shoulder_pitch_joint
+    - 25    # left_shoulder_roll_joint
+    - 25    # left_shoulder_yaw_joint
+    - 25    # left_elbow_joint
+    - 25    # left_wrist_roll_joint
+    - 5     # left_wrist_pitch_joint
+    - 5     # left_wrist_yaw_joint
+    - 25    # right_shoulder_pitch_joint
+    - 25    # right_shoulder_roll_joint
+    - 25    # right_shoulder_yaw_joint
+    - 25    # right_elbow_joint
+    - 25    # right_wrist_roll_joint
+    - 5     # right_wrist_pitch_joint
+    - 5     # right_wrist_yaw_joint

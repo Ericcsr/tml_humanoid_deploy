@@ -69,13 +69,17 @@ def _mesh_to_heightmap(vertices: np.ndarray, grid_res: float, floor_threshold: f
 def _heightmap_to_columns(
     hmap: np.ndarray, x_min: float, y_min: float, grid_res: float,
     min_height: float = 0.02,
+    xy_scale: float = 1.0,
 ) -> List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]]:
     """
     Convert height map to column boxes. Each non-zero cell becomes a box.
     Returns list of ((pos_x, pos_y, pos_z), (half_x, half_y, half_z)).
     """
+    xy_scale = float(xy_scale)
+    if xy_scale <= 0.0 or xy_scale > 1.0:
+        raise ValueError("terrain column xy_scale must be in (0, 1].")
     columns = []
-    half_res = grid_res / 2.0
+    half_res = grid_res * xy_scale / 2.0
     n_rows, n_cols = hmap.shape
     for r in range(n_rows):
         for c in range(n_cols):
@@ -110,6 +114,7 @@ def urdf_to_mujoco_xml(
     use_columns_for_collision: bool = True,
     terrain_column_res: float = 0.2,
     terrain_floor_threshold: float = 0.02,
+    terrain_column_xy_scale: float = 1.0,
 ) -> Tuple[str, str]:
     """
     Convert a URDF file (e.g. static terrain) to MuJoCo MJCF XML fragment.
@@ -202,7 +207,12 @@ def urdf_to_mujoco_xml(
                 vertices, terrain_column_res, terrain_floor_threshold
             )
             columns = _heightmap_to_columns(
-                hmap, x_min, y_min, terrain_column_res, terrain_floor_threshold
+                hmap,
+                x_min,
+                y_min,
+                terrain_column_res,
+                terrain_floor_threshold,
+                xy_scale=terrain_column_xy_scale,
             )
             for i, (pos, size) in enumerate(columns):
                 px, py, pz = pos
@@ -233,7 +243,12 @@ def urdf_to_mujoco_xml(
     return mesh_xml, body_xml
 
 
-def urdf_to_mujoco_object(urdf_path: str) -> Tuple[str, str]:
+def urdf_to_mujoco_object(
+    urdf_path: str,
+    object_mass: float | None = None,
+    object_friction: Tuple[float, float, float] | None = None,
+    object_box_extra_height: float = 0.0,
+) -> Tuple[str, str]:
     """
     Convert an object URDF (multi-link with fixed joints) to a single MuJoCo free body.
     Flattens all links into one body with freejoint. Handles box, cylinder, sphere, mesh.
@@ -302,6 +317,17 @@ def urdf_to_mujoco_object(urdf_path: str) -> Tuple[str, str]:
 
     geom_parts = []
     mesh_assets = []
+    friction_attr = ""
+    if object_friction is not None:
+        if len(object_friction) != 3:
+            raise ValueError("object_friction must be length-3: [slide, torsional, roll]")
+        fr = tuple(float(x) for x in object_friction)
+        if any(x < 0.0 for x in fr):
+            raise ValueError(f"object_friction entries must be non-negative, got {fr}")
+        friction_attr = f' friction="{fr[0]:g} {fr[1]:g} {fr[2]:g}"'
+    box_extra_height = float(object_box_extra_height)
+    if box_extra_height < 0.0:
+        raise ValueError(f"object_box_extra_height must be non-negative, got {box_extra_height}")
     for link in root_elem.findall("link"):
         link_name = link.get("name", "link")
         pos, rpy = link_to_root_transform(link_name)
@@ -329,23 +355,31 @@ def urdf_to_mujoco_object(urdf_path: str) -> Tuple[str, str]:
             if geo.tag == "box":
                 size_str = geo.get("size", "0.1 0.1 0.1")
                 parts = size_str.split()
-                half = [float(p) / 2 for p in parts[:3]] if len(parts) >= 3 else [0.05, 0.05, 0.05]
+                full = [float(p) for p in parts[:3]] if len(parts) >= 3 else [0.1, 0.1, 0.1]
+                if box_extra_height:
+                    full[2] += box_extra_height
+                    pos_arr = np.asarray(pos, dtype=np.float64).copy()
+                    pos_arr[2] += box_extra_height / 2.0
+                    box_pos_str = f"{pos_arr[0]} {pos_arr[1]} {pos_arr[2]}"
+                else:
+                    box_pos_str = pos_str
+                half = [p / 2.0 for p in full]
                 geom_parts.append(
-                    f'      <geom name="object_{link_name}_{geo.tag}" type="box" pos="{pos_str}" quat="{quat_str}" '
-                    f'size="{" ".join(map(str, half))}" contype="1" conaffinity="1" rgba="{rgba}"/>'
+                    f'      <geom name="object_{link_name}_{geo.tag}" type="box" pos="{box_pos_str}" quat="{quat_str}" '
+                    f'size="{" ".join(map(str, half))}" contype="1" conaffinity="1" rgba="{rgba}"{friction_attr}/>'
                 )
             elif geo.tag == "cylinder":
                 r = float(geo.get("radius", 0.05))
                 l = float(geo.get("length", 0.1))
                 geom_parts.append(
                     f'      <geom name="object_{link_name}_{geo.tag}" type="cylinder" pos="{pos_str}" quat="{quat_str}" '
-                    f'size="{r} {l/2}" contype="1" conaffinity="1" rgba="{rgba}"/>'
+                    f'size="{r} {l/2}" contype="1" conaffinity="1" rgba="{rgba}"{friction_attr}/>'
                 )
             elif geo.tag == "sphere":
                 r = float(geo.get("radius", 0.05))
                 geom_parts.append(
                     f'      <geom name="object_{link_name}_{geo.tag}" type="sphere" pos="{pos_str}" quat="{quat_str}" '
-                    f'size="{r}" contype="1" conaffinity="1" rgba="{rgba}"/>'
+                    f'size="{r}" contype="1" conaffinity="1" rgba="{rgba}"{friction_attr}/>'
                 )
             elif geo.tag == "mesh":
                 filename = geo.get("filename")
@@ -359,16 +393,21 @@ def urdf_to_mujoco_object(urdf_path: str) -> Tuple[str, str]:
                 mesh_assets.append(f'    <mesh name="{mesh_name}" file="{mesh_path}" scale="{scale}"/>')
                 geom_parts.append(
                     f'      <geom name="object_{link_name}_mesh" type="mesh" pos="{pos_str}" quat="{quat_str}" '
-                    f'mesh="{mesh_name}" contype="1" conaffinity="1" rgba="{rgba}"/>'
+                    f'mesh="{mesh_name}" contype="1" conaffinity="1" rgba="{rgba}"{friction_attr}/>'
                 )
 
     if not geom_parts:
         return "", ""
 
+    mass = 1.0 if object_mass is None else float(object_mass)
+    if mass <= 0.0:
+        raise ValueError(f"object_mass must be positive, got {mass}")
+    # Existing converter used mass=1 and diaginertia=0.01; scale inertia with mass.
+    diag = 0.01 * mass
     body_xml = (
         '    <body name="floating_object" pos="0 0 0" quat="1 0 0 0">\n'
         '      <freejoint name="object_floating_joint"/>\n'
-        '      <inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01"/>\n'
+        f'      <inertial pos="0 0 0" mass="{mass:g}" diaginertia="{diag:g} {diag:g} {diag:g}"/>\n'
         + "\n".join(geom_parts) + "\n"
         "    </body>"
     )
@@ -376,12 +415,23 @@ def urdf_to_mujoco_object(urdf_path: str) -> Tuple[str, str]:
     return body_xml, asset_xml
 
 
-def merge_object_into_scene(scene_xml: str, object_urdf_path: str) -> str:
+def merge_object_into_scene(
+    scene_xml: str,
+    object_urdf_path: str,
+    object_mass: float | None = None,
+    object_friction: Tuple[float, float, float] | None = None,
+    object_box_extra_height: float = 0.0,
+) -> str:
     """
     Merge a floating object from URDF into the scene (at end of worldbody).
     Object is added LAST so robot qpos/qvel indices (0-35, 0-34) stay unchanged.
     """
-    body_xml, asset_xml = urdf_to_mujoco_object(object_urdf_path)
+    body_xml, asset_xml = urdf_to_mujoco_object(
+        object_urdf_path,
+        object_mass=object_mass,
+        object_friction=object_friction,
+        object_box_extra_height=object_box_extra_height,
+    )
     if not body_xml:
         return scene_xml
 
@@ -569,6 +619,7 @@ def merge_terrain_into_scene_from_string(
     use_columns_for_collision: bool = True,
     terrain_column_res: float = 0.2,
     terrain_floor_threshold: float = 0.02,
+    terrain_column_xy_scale: float = 1.0,
     terrain_urdf_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> str:
     """
@@ -581,6 +632,7 @@ def merge_terrain_into_scene_from_string(
         use_columns_for_collision=use_columns_for_collision,
         terrain_column_res=terrain_column_res,
         terrain_floor_threshold=terrain_floor_threshold,
+        terrain_column_xy_scale=terrain_column_xy_scale,
     )
     if not mesh_xml or not body_xml:
         return scene_xml
@@ -612,6 +664,7 @@ def merge_terrain_into_scene(
     use_columns_for_collision: bool = True,
     terrain_column_res: float = 0.2,
     terrain_floor_threshold: float = 0.02,
+    terrain_column_xy_scale: float = 1.0,
     terrain_urdf_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> str:
     """
@@ -627,6 +680,7 @@ def merge_terrain_into_scene(
         use_columns_for_collision=use_columns_for_collision,
         terrain_column_res=terrain_column_res,
         terrain_floor_threshold=terrain_floor_threshold,
+        terrain_column_xy_scale=terrain_column_xy_scale,
         terrain_urdf_offset=terrain_urdf_offset,
     )
     if output_path:

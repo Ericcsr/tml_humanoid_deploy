@@ -940,7 +940,7 @@ class RLContactPolicy(RLBasePolicy):
         control_signals["compliance"] = self.keyboard_controller.get_compliance()
         mid = self.ticker if self.ticker < self.motion_length else self.motion_length-1
         control_signals["contact_mask"] = self.contact_mask[mid]
-        print(control_signals["contact_mask"])
+        #print(control_signals["contact_mask"])
         return control_signals
 
     def prepare_obs(self, robot_state, control_signals):
@@ -1288,7 +1288,7 @@ class RLStreamingContactPolicy(RLBasePolicy):
             "motion_anchor_ori_b": (anchor_rot_inv * target_anchor_rot).as_matrix()[:, :2].reshape(-1).astype(np.float32),
         }
         control_signals["projected_gravity"] = anchor_rot_inv.apply(np.array([0, 0, -1]))
-        print(control_signals["contact_mask"])
+        #print(control_signals["contact_mask"])
         return control_signals
 
     def prepare_obs(self, robot_state, control_signals):

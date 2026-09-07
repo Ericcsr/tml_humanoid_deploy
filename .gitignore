@@ -1,5 +1,8 @@
 __pycache__/
 exported_policies/**/
+# Track gear-sonic release weights and YAML (ONNX via git-lfs).
+!exported_policies/gear_sonic/
+!exported_policies/gear_sonic/**
 *.zip
 
 # Temp merged MuJoCo scenes (written under system temp via tempfile; ignore stragglers in repo root)

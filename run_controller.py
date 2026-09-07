@@ -15,6 +15,7 @@ from rl_policy import (
     RLStreamingContactPolicy,
     clamp_ref_motion_start_index,
 )
+from gear_sonic_g1_onnx_policy import build_gear_sonic_g1_onnx_policy
 
 from utils.params import DEFAULT_POSE, ACTION_SCALE, ISAAC_TO_MUJOCO
 from utils.robot_utils import Rate
@@ -109,8 +110,9 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
     heading_align_rot = None  # rotation to align robot's initial heading with ref (removes heading-induced xy drift)
 
     while True:
-        
+        ts = time.time()
         robot_state.q, robot_state.dq, robot_state.imu_quat, robot_state.omega = env.get_robot_state()
+        priv_root = None
         if config["use_root_state"]:
             if config.get("use_odom", False):
                 redis_client.set("proprio_data", pickle.dumps(np.hstack((
@@ -133,6 +135,8 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
                 init_heading_rot = Rotation.from_euler("z", init_heading)
                 init = True
             robot_state.root_orn = (init_heading_rot.inv() * Rotation.from_quat(robot_state.imu_quat)).as_quat()
+            if compute_metrics_flag and hasattr(env, "get_root_state"):
+                priv_root = env.get_root_state()
         control_signals = policy.prepare_control_signals(robot_state)
         obs = policy.prepare_obs(robot_state, control_signals) # Should be reference motion.
         
@@ -144,8 +148,12 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
 
         # Compute metrics: robot state is from start of loop (after prev step); ticker was just incremented.
         # So robot = result of (ticker-1) steps, ref frame (ticker-1) is the one we used for that action.
-        # Requires use_root_state for root_pos/root_orn.
-        if compute_metrics_flag and config["use_root_state"]:
+        # Privileged/odom root is used only for reporting; policy may have used IMU-only orientation.
+        if compute_metrics_flag and (config["use_root_state"] or priv_root is not None):
+            if priv_root is not None:
+                robot_state.root_pos, robot_state.root_orn, robot_state.root_vel = priv_root
+                if hasattr(env, "get_anchor_state"):
+                    robot_state.anchor_pos, robot_state.anchor_orn = env.get_anchor_state()
             si = getattr(policy, "ref_motion_start_index", 0)
             if policy.ticker > si:
                 mid = policy.ticker - 1
@@ -196,6 +204,7 @@ def main(env, policy, config, ticker_value=None, compute_metrics_flag=False):
 
         scaled_action = action[ISAAC_TO_MUJOCO] * policy.action_scale + policy.default_value["q"][ISAAC_TO_MUJOCO]
         env.step_robot(scaled_action)
+        print(f"Time taken: {time.time() - ts:.6f}s")
         rate.sleep()
 
 if __name__ == "__main__":
@@ -219,8 +228,11 @@ if __name__ == "__main__":
     config["use_odom"] = args.use_odom
     config["slow_down"] = args.slow_down
 
-    if args.metric and not config.get("use_root_state", False):
-        raise ValueError("--metric requires use_root_state: True in config (for root position/orientation).")
+    if args.metric and not config.get("use_root_state", False) and not args.use_sim:
+        raise ValueError(
+            "--metric on hardware requires use_root_state: True (and typically --use_odom). "
+            "Sim can still report privileged root errors when use_root_state is False."
+        )
 
     if args.slow_down != 1.0:
         print(f"[run_controller] Slow down: {args.slow_down}x (simulation_dt unchanged)", flush=True)
@@ -333,6 +345,8 @@ if __name__ == "__main__":
                 init_at_first_frame=init_at_first_frame,
                 ref_motion_start_index=config["ref_motion_start_index"],
             )                    
+    elif config.get("use_gear_sonic_g1_onnx", False):
+        policy = build_gear_sonic_g1_onnx_policy(config)
     elif config.get("use_streaming_motion", False):
         policy = RLStreamingContactPolicy(
             config["onnx_model_path"],

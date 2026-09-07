@@ -68,9 +68,9 @@ FOOT_BODIES = ("left_ankle_roll_link", "right_ankle_roll_link")
 DEFAULT_DETECT_CONFIG = {
     "FILTER_ORDER": 4,
     "FILTER_CUTOFF": 6.0,
-    "VEL_THRESH_RANGE": (0.05, 0.5),
+    "VEL_THRESH_RANGE": (0.05, 0.7),
     "ACC_THRESH_RANGE": (1.0, 6.0),
-    "ENERGY_SCALE": 0.5,
+    "ENERGY_SCALE": 0.7,
     "ENERGY_GAUSSIAN_SIGMA": 10,
 }
 
