@@ -27,7 +27,7 @@ import onnxruntime
 from scipy.spatial.transform import Rotation
 
 from rl_policy import clamp_ref_motion_start_index
-from utils.math_utils import yaw_quat
+from utils.math_utils import heading_zup, yaw_quat_xyzw
 from utils.params import ISAAC_TO_MUJOCO, MUJOCO_TO_ISAAC
 
 
@@ -71,7 +71,7 @@ def _rot6d_robot_to_ref(robot_quat_xyzw: np.ndarray, ref_quat_xyzw: np.ndarray) 
 
 
 def _yaw_rotation(quat_xyzw: np.ndarray) -> Rotation:
-    return Rotation.from_quat(yaw_quat(np.asarray(quat_xyzw, dtype=np.float64).reshape(4)))
+    return Rotation.from_quat(yaw_quat_xyzw(np.asarray(quat_xyzw, dtype=np.float64).reshape(4)))
 
 
 def _motion_anchor_pos_b_world(
@@ -367,7 +367,7 @@ class RLGearSonicG1OnnxPolicy:
             self.init_root_pos[2] = 0.0
             ref_q_wxyz = self.ref_motion["body_quat_w"][si, 0].astype(np.float64)
             ref_q_xyzw = _wxyz_to_xyzw(ref_q_wxyz)
-            self.init_root_heading_inv = Rotation.from_quat(yaw_quat(ref_q_xyzw)).inv()
+            self.init_root_heading_inv = Rotation.from_quat(yaw_quat_xyzw(ref_q_xyzw)).inv()
 
         self.ref_q_pos = self.ref_motion["joint_pos"].copy()
         self.ref_q_vel = self.ref_motion["joint_vel"].copy()
@@ -520,6 +520,13 @@ class RLGearSonicG1OnnxPolicy:
         #   apply_delta_heading = heading(init_base_quat) * inv_heading(init_ref_root_quat)
         self._apply_delta_heading = _yaw_rotation(robot_q) * _yaw_rotation(ref_q0).inv()
         self._heading_initialized = True
+        robot_yaw = heading_zup(robot_q)
+        ref_yaw = heading_zup(ref_q0)
+        print(
+            f"[RLGearSonicG1OnnxPolicy] Heading alignment: robot_yaw={np.degrees(robot_yaw):.1f}° "
+            f"ref_yaw={np.degrees(ref_yaw):.1f}° Δ={np.degrees(robot_yaw - ref_yaw):.1f}°",
+            flush=True,
+        )
 
     def _corrected_ref_quat_xyzw(self, frame_idx: int) -> np.ndarray:
         ref_q = _wxyz_to_xyzw(self.ref_anchor_orns_wxyz[frame_idx])
@@ -800,7 +807,11 @@ def build_gear_sonic_g1_onnx_policy(cfg: dict) -> RLGearSonicG1OnnxPolicy:
         encoder_index=float(cfg.get("gear_sonic_encoder_index", 0.0)),
         encoder_tokenizer_slice=enc_slice,
         omega_is_world_frame=bool(cfg.get("gear_sonic_omega_is_world_frame", False)),
-        apply_heading_alignment=bool(cfg.get("gear_sonic_apply_heading_alignment", False)),
+        apply_heading_alignment=bool(
+            cfg["gear_sonic_apply_heading_alignment"]
+            if "gear_sonic_apply_heading_alignment" in cfg
+            else not bool(cfg.get("use_root_state", False))
+        ),
         use_history_buffer=bool(cfg.get("gear_sonic_use_history_buffer", True)),
         use_root_state=bool(cfg.get("use_root_state", False)),
     )

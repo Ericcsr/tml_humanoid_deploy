@@ -42,7 +42,7 @@ rl_policy:
   gear_sonic_encoder_index: 0.0
   # MuJoCo qvel[3:6] is body-frame; False = pass as-is (correct for both sim and real hardware).
   gear_sonic_omega_is_world_frame: False
-  gear_sonic_apply_heading_alignment: False
+  gear_sonic_apply_heading_alignment: True
   gear_sonic_use_history_buffer: True
 
   mujoco_xml_path: "assets/g1/scene_29dof_flat_hand.xml"

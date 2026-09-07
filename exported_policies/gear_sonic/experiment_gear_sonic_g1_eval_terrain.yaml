@@ -56,7 +56,7 @@ rl_policy:
 
   gear_sonic_encoder_index: 0.0
   gear_sonic_omega_is_world_frame: False
-  gear_sonic_apply_heading_alignment: False
+  gear_sonic_apply_heading_alignment: True
   gear_sonic_use_history_buffer: True
 
   control_dt: 0.02

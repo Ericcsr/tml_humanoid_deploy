@@ -33,7 +33,7 @@ rl_policy:
 
   # onnx_model_path: "path/to/model_step_XXXXXX_g1.onnx"
 
-  ref_motion_path: "../bm_generalist/twist_lafan_new/fightAndSports1_subject4.npz"
+  ref_motion_path: "../twist_lafan_new/AMASS_g1_GMR8_Transitions_mazen_c3d_kick_walk_stageii.npz"
   #contact_labels_path: "exported_policies/zhen_terrain/stitched_motion_contact_labels_grasp.npy"
 
   gear_sonic_num_future_frames: 5
@@ -63,7 +63,9 @@ rl_policy:
   # also body-frame.  Default False = pass omega as-is (already body frame).
   # Set True only if your driver supplies world-frame angular velocity.
   gear_sonic_omega_is_world_frame: False
-  gear_sonic_apply_heading_alignment: False
+  # Warp ref heading into the robot's initial frame (C++ ComputeApplyDeltaHeading).
+  # Needed when use_root_state is False: IMU heading is reset to 0 while clips often start ~±90°.
+  gear_sonic_apply_heading_alignment: True
   # True: 10-step ring buffer oldest→newest (matches StateLogger::GetLatest(..., newest_first=false)).
   gear_sonic_use_history_buffer: True
 

@@ -1,0 +1,135 @@
+# GEAR-SONIC stair-down (single motion). Scene from zhen_terrain/experiment_stair_down.yaml.
+#
+#   python run_controller.py --use_sim \
+#     --config exported_policies/gear_sonic/experiment_gear_sonic_g1_stair_down.yaml
+
+rl_policy:
+  use_gear_sonic_g1_onnx: True
+  use_streaming_motion: False
+  use_contact: False
+  use_chip: False
+
+  gear_sonic_deploy_policy_dir: "exported_policies/gear_sonic"
+  gear_sonic_encoder_onnx_name: "model_encoder.onnx"
+  gear_sonic_decoder_onnx_name: "model_decoder.onnx"
+
+  ref_motion_path: "exported_policies/zhen_terrain/extended_walk_downstair.npz"
+  mujoco_xml_path: "assets/g1/scene_29dof_flat_hand.xml"
+  terrain_mesh_collision: True
+  terrain_boxes:
+    stair1:
+      pos: [0.66, 0.0, 0.08]
+      size: [0.26, 1.9, 0.16]
+    stair2:
+      pos: [0.40, 0.0, 0.25]
+      size: [0.26, 1.9, 0.18]
+    stair3:
+      pos: [-0.13, 0.0, 0.43]
+      size: [0.8, 1.9, 0.18]
+
+  gear_sonic_num_future_frames: 5
+  lookahead_frame_skips: 1
+  init_at_first_frame: False
+  ref_motion_start_index: 0
+  gear_sonic_num_dof: 29
+  gear_sonic_encoder_index: 0.0
+  gear_sonic_omega_is_world_frame: False
+  gear_sonic_apply_heading_alignment: True
+  gear_sonic_use_history_buffer: True
+
+  use_root_state: False
+  control_dt: 0.02
+  simulation_dt: 0.005
+
+  joint_stiffness:
+    - 99.0984
+    - 99.0984
+    - 40.1792
+    - 99.0984
+    - 28.5012
+    - 28.5012
+    - 99.0984
+    - 99.0984
+    - 40.1792
+    - 99.0984
+    - 28.5012
+    - 28.5012
+    - 40.1792
+    - 28.5012
+    - 28.5012
+    - 14.2506
+    - 14.2506
+    - 14.2506
+    - 14.2506
+    - 14.2506
+    - 16.7783
+    - 16.7783
+    - 14.2506
+    - 14.2506
+    - 14.2506
+    - 14.2506
+    - 14.2506
+    - 16.7783
+    - 16.7783
+
+  joint_damping:
+    - 6.3088
+    - 6.3088
+    - 2.5579
+    - 6.3088
+    - 1.8144
+    - 1.8144
+    - 6.3088
+    - 6.3088
+    - 2.5579
+    - 6.3088
+    - 1.8144
+    - 1.8144
+    - 2.5579
+    - 1.8144
+    - 1.8144
+    - 0.9072
+    - 0.9072
+    - 0.9072
+    - 0.9072
+    - 0.9072
+    - 1.0681
+    - 1.0681
+    - 0.9072
+    - 0.9072
+    - 0.9072
+    - 0.9072
+    - 0.9072
+    - 1.0681
+    - 1.0681
+
+  torque_limit:
+    - 139
+    - 139
+    - 88
+    - 139
+    - 25
+    - 25
+    - 139
+    - 139
+    - 88
+    - 139
+    - 25
+    - 25
+    - 88
+    - 25
+    - 25
+    - 25
+    - 25
+    - 25
+    - 25
+    - 25
+    - 5
+    - 5
+    - 25
+    - 25
+    - 25
+    - 25
+    - 25
+    - 5
+    - 5
